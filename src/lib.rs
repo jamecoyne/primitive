@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use bytemuck::{Pod, Zeroable};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
@@ -10,15 +9,8 @@ use winit::window::{Window, WindowId};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-#[repr(C)]
-#[derive(Copy, Clone, Pod, Zeroable)]
-struct Uniforms {
-    resolution: [f32; 2],
-    mouse: [f32; 2],
-    time: f32,
-    // pad to 32 bytes — std140 requires the block size to be a multiple of 16
-    _pad: [f32; 3],
-}
+pub mod render_graph;
+use render_graph::{NodeContext, RenderGraph, DEFAULT_GRAPH_TOML};
 
 /// Test-mode overrides parsed from URL params on web. None on native.
 /// When `time` is Some, the time uniform is frozen at that value. When
@@ -30,113 +22,13 @@ struct TestLock {
     mouse_uv: Option<[f32; 2]>,
 }
 
-/// Pipeline + uniform buffer + bind group for the mandelbrot. Holds nothing
-/// surface-specific so it can be reused by the offscreen render path used in
-/// native tests. Created once per device.
-struct Renderer {
-    pipeline: wgpu::RenderPipeline,
-    uniform_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
-}
-
-fn create_renderer(device: &wgpu::Device, format: wgpu::TextureFormat) -> Renderer {
-    // GLSL → naga → backend SPIR-V/MSL/WGSL/GLSL ES.
-    let vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("mandelbrot.vert"),
-        source: wgpu::ShaderSource::Glsl {
-            shader: include_str!("../shaders/mandelbrot.vert").into(),
-            stage: wgpu::naga::ShaderStage::Vertex,
-            defines: Default::default(),
-        },
-    });
-    let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("mandelbrot.frag"),
-        source: wgpu::ShaderSource::Glsl {
-            shader: include_str!("../shaders/mandelbrot.frag").into(),
-            stage: wgpu::naga::ShaderStage::Fragment,
-            defines: Default::default(),
-        },
-    });
-
-    let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("uniforms"),
-        size: std::mem::size_of::<Uniforms>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("bind-layout"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    });
-
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("bind-group"),
-        layout: &bind_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: uniform_buffer.as_entire_binding(),
-        }],
-    });
-
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("pipeline-layout"),
-        bind_group_layouts: &[&bind_layout],
-        push_constant_ranges: &[],
-    });
-
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("mandelbrot-pipeline"),
-        layout: Some(&pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &vs,
-            entry_point: Some("main"),
-            buffers: &[],
-            compilation_options: Default::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &fs,
-            entry_point: Some("main"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: Default::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            ..Default::default()
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview: None,
-        cache: None,
-    });
-
-    Renderer {
-        pipeline,
-        uniform_buffer,
-        bind_group,
-    }
-}
-
 struct State {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    renderer: Renderer,
+    graph: RenderGraph,
     // Format used for the render-pass color attachment. May differ from
     // config.format: on web the WebGPU canvas only accepts non-sRGB
     // storage formats, so we render through an sRGB view of the canvas
@@ -238,7 +130,8 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        let renderer = create_renderer(&device, view_format);
+        let graph = RenderGraph::from_toml(&device, view_format, DEFAULT_GRAPH_TOML)
+            .expect("config/graph.toml is valid at compile time");
 
         let default_mouse = [size.width as f32 * 0.5, size.height as f32 * 0.5];
         let mouse = match lock.mouse_uv {
@@ -251,7 +144,7 @@ impl State {
             device,
             queue,
             config,
-            renderer,
+            graph,
             view_format,
             start: web_time::Instant::now(),
             mouse,
@@ -285,39 +178,23 @@ impl State {
             .lock
             .time
             .unwrap_or_else(|| self.start.elapsed().as_secs_f32());
-        let uniforms = Uniforms {
-            resolution: [self.config.width as f32, self.config.height as f32],
-            mouse: self.mouse,
-            time,
-            _pad: [0.0; 3],
-        };
-        self.queue
-            .write_buffer(&self.renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("encoder"),
             });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.renderer.pipeline);
-            pass.set_bind_group(0, &self.renderer.bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        let mut ctx = NodeContext {
+            encoder: &mut encoder,
+            queue: &self.queue,
+            output: &view,
+            width: self.config.width,
+            height: self.config.height,
+            time,
+            mouse: self.mouse,
+        };
+        self.graph.render(&mut ctx);
+
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())
@@ -565,7 +442,8 @@ pub async fn render_offscreen(cfg: RenderConfig) -> Vec<u8> {
         .expect("offscreen: request_device");
 
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let renderer = create_renderer(&device, format);
+    let graph = RenderGraph::from_toml(&device, format, DEFAULT_GRAPH_TOML)
+        .expect("config/graph.toml is valid at compile time");
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("offscreen-target"),
@@ -582,17 +460,6 @@ pub async fn render_offscreen(cfg: RenderConfig) -> Vec<u8> {
         view_formats: &[],
     });
     let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-
-    let uniforms = Uniforms {
-        resolution: [cfg.width as f32, cfg.height as f32],
-        mouse: [
-            cfg.mouse_uv[0] * cfg.width as f32,
-            cfg.mouse_uv[1] * cfg.height as f32,
-        ],
-        time: cfg.time,
-        _pad: [0.0; 3],
-    };
-    queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
     // wgpu's copy_texture_to_buffer requires bytes_per_row to be a multiple
     // of 256. We pad in the staging buffer and strip the padding on readback.
@@ -613,23 +480,19 @@ pub async fn render_offscreen(cfg: RenderConfig) -> Vec<u8> {
         label: Some("offscreen-encoder"),
     });
     {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("offscreen-pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            occlusion_query_set: None,
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&renderer.pipeline);
-        pass.set_bind_group(0, &renderer.bind_group, &[]);
-        pass.draw(0..3, 0..1);
+        let mut ctx = NodeContext {
+            encoder: &mut encoder,
+            queue: &queue,
+            output: &view,
+            width: cfg.width,
+            height: cfg.height,
+            time: cfg.time,
+            mouse: [
+                cfg.mouse_uv[0] * cfg.width as f32,
+                cfg.mouse_uv[1] * cfg.height as f32,
+            ],
+        };
+        graph.render(&mut ctx);
     }
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
