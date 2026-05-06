@@ -1,0 +1,72 @@
+name: Test
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same PR/branch — only the latest commit needs
+# to pass.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # macos-latest gives us Apple Silicon + Metal, which both the native
+    # render_offscreen path (wgpu/Metal backend) and the headless Chromium
+    # WebGPU path (--use-angle=metal) depend on.
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Pre-install wasm-bindgen-cli at the version pinned in Cargo.lock
+      # (precompiled binary; ~seconds vs minutes for cargo install).
+      - name: Resolve wasm-bindgen version
+        id: wbg
+        run: |
+          v=$(awk '
+            /^\[\[package\]\]/ { in_pkg=1; name=""; next }
+            in_pkg && /^name = "wasm-bindgen"$/ { name="wasm-bindgen"; next }
+            in_pkg && /^version = / && name=="wasm-bindgen" { gsub(/version = |"/,""); print; exit }
+          ' Cargo.lock)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@${{ steps.wbg.outputs.version }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - run: npm test
+
+      # Diagnostic artifacts for failing PRs — screenshots + console log + the
+      # frames that caused any cross-platform pixel diff.
+      - name: Upload test outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-outputs
+          path: |
+            tests/output/
+            tests/baseline.png
+            tests/baseline-native.png
+          if-no-files-found: ignore
+          retention-days: 14
