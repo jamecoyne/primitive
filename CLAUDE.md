@@ -10,7 +10,7 @@ the web entry point.
 | Target | Command | Notes |
 |---|---|---|
 | Native (Mac) | `npm run dev:native` (alias for `cargo run --release`) | Metal backend, opens a winit window |
-| Web (one-liner) | `npm run dev:web` | Builds, serves on `http://127.0.0.1:8000`, opens default browser. `PORT=...` to override; falls through to next free port if taken. |
+| Web (one-liner) | `npm run dev:web` | Builds, serves on `http://127.0.0.1:8000`, opens default browser. `PORT=...` to override; falls through to next free port if taken. Canvas fills the viewport at full DPR and tracks viewport resizes via winit's ResizeObserver. |
 | Web (manual) | `./build-web.sh` then `cd web/dist && python3 -m http.server 8000` | Use this when you don't want a browser tab to open. |
 
 `build-web.sh` reads the `wasm-bindgen` version from `Cargo.lock` and
@@ -20,10 +20,11 @@ exactly or the wasm fails to load.
 ## Test harness
 
 ```
-npm test                          # native + web + cross-platform
+npm test                          # native + web + cross-platform + responsive
 npm run test:native               # cargo test --test headless
 npm run test:web                  # ./build-web.sh + Playwright screenshot harness
 npm run test:cross                # strict pixel-perfect cross-platform diff
+npm run test:responsive           # DPR=2 + viewport-resize behaviour
 UPDATE_BASELINE=1 npm test        # regenerate native + web baselines
 ```
 
@@ -155,3 +156,15 @@ without updating both the workflow and `build-web.sh`.
   only non-sRGB storage formats, so without this fix the linear shader
   output is written raw on web while native picks an sRGB format and
   applies the encoding. Pre-fix diff: 91% of pixels differ; post-fix: 0.
+- **Two things are needed to make the web canvas fill the viewport at
+  full DPR and resize correctly.** (a) `index.html` sets
+  `c.width = innerWidth × devicePixelRatio` (and same for height) before
+  init — without the DPR multiplier, on Retina the drawing buffer is half
+  the physical size and the canvas displays at quarter screen. (b) the
+  CSS rules `width: 100vw` and `height: 100vh` on `canvas#wgpu` are
+  marked `!important`. winit's web backend writes inline `style.width`
+  and `style.height` on the canvas based on the initial PhysicalSize,
+  which would otherwise pin the CSS size and prevent the canvas from
+  tracking viewport resizes. With `!important` in place winit's
+  ResizeObserver picks up the layout change and emits `WindowEvent::Resized`,
+  which our `State::resize` then uses to reconfigure the surface.

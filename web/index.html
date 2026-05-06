@@ -13,8 +13,12 @@
   }
   canvas#wgpu {
     display: block;
-    width: 100vw;
-    height: 100vh;
+    /* `!important` is required: winit's web backend writes inline
+       `style.width`/`style.height` on the canvas based on the initial
+       PhysicalSize, which would otherwise pin the CSS size and prevent
+       100vw/100vh from tracking viewport resizes. */
+    width: 100vw !important;
+    height: 100vh !important;
     /* Strip every form of browser-injected canvas chrome — without these
        Chromium paints a 1px focus outline (rgb(0,95,204)) that bleeds into
        the rendered area and breaks pixel-perfect cross-platform parity. */
@@ -28,12 +32,16 @@
   <canvas id="wgpu"></canvas>
   <script type="module">
     import init from './wgpuweb.js';
-    // Match drawing-buffer dimensions to the CSS viewport before the wasm
-    // reads them in `parse_test_lock_from_url`/`State::new`. winit's
-    // ResizeObserver picks up subsequent CSS-size changes from here.
+    // Set the drawing buffer to physical pixels (CSS pixels × devicePixelRatio)
+    // so on Retina the canvas renders at full display resolution and CSS still
+    // sizes the canvas to fill the viewport. Without the DPR multiplier the
+    // buffer would be half the physical size on DPR=2 and winit would set
+    // canvas.style to half the viewport — quarter screen visually.
+    // winit's ResizeObserver picks up subsequent CSS-size changes from here.
     const c = document.getElementById('wgpu');
-    c.width = window.innerWidth;
-    c.height = window.innerHeight;
+    const dpr = window.devicePixelRatio || 1;
+    c.width  = Math.round(window.innerWidth  * dpr);
+    c.height = Math.round(window.innerHeight * dpr);
     await init();
   </script>
 </body>
