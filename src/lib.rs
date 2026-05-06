@@ -375,7 +375,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         let attrs = Window::default_attributes()
-            .with_title("Mandelbrot — wgpu")
+            .with_title("Primative")
             .with_inner_size(PhysicalSize::new(960u32, 720));
 
         #[cfg(target_arch = "wasm32")]
