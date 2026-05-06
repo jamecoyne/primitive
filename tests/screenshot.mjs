@@ -1,13 +1,15 @@
-// Headless screenshot test for the wasm build.
+// Headless screenshot harness for the wasm build.
 //
-// Spins up a local static server for web/dist/, launches Chromium, waits for
-// the wasm to render, screenshots the page, and analyzes pixel brightness.
-// Saves diagnostics to tests/output/ for inspection.
+// Three checks:
+//   1. Console-error gate     — any [error] / [pageerror] line fails.
+//   2. Pinned-baseline diff   — fixed time + mouse uv → deterministic frame,
+//                                compared to tests/baseline.png. Catches
+//                                shader regressions, surface format drift.
+//   3. Mouse-API responsive   — image must change after page.mouse.move(...).
 //
-// Exit code:
-//   0 — canvas is rendering (avg brightness > MIN_AVG and color variance > MIN_VAR)
-//   1 — canvas is black/uniform (the bug we're chasing)
-//   2 — infra error (server, browser, build missing)
+// Build the wasm first (./build-web.sh). Run with `npm test`. Run with
+// `UPDATE_BASELINE=1 npm test` to regenerate tests/baseline.png from the
+// current renderer.
 
 import { chromium } from 'playwright';
 import { PNG } from 'pngjs';
@@ -19,6 +21,19 @@ import { fileURLToPath } from 'node:url';
 const ROOT = resolve(fileURLToPath(import.meta.url), '../..');
 const DIST = join(ROOT, 'web/dist');
 const OUT  = join(ROOT, 'tests/output');
+const BASELINE_PATH = join(ROOT, 'tests/baseline.png');
+
+// URL params that lock time + mouse for a deterministic frame.
+const BASELINE_PARAMS = 't=2.5&mx=0.5&my=0.5';
+// For the mouse-API check we lock time but leave the mouse free so the
+// diff between the two screenshots reflects only the cursor move, not
+// time-based zoom/color drift.
+const MOUSE_TEST_PARAMS = 't=2.5';
+
+const MIN_AVG_LUMA   = 8;   // catches all-black canvas
+const MIN_RGB_RANGE  = 30;  // catches uniform-colour canvas
+const MIN_MOUSE_DIFF = 12;  // mouse move must shift image
+const MAX_BASELINE_DIFF = 8; // tuned for same-host runs; bump if cross-host
 
 const MIME = {
     '.html': 'text/html; charset=utf-8',
@@ -51,7 +66,6 @@ function startServer() {
             const mime = MIME[extname(filePath)] ?? 'application/octet-stream';
             res.writeHead(200, {
                 'Content-Type': mime,
-                // COOP/COEP for cross-origin isolation (needed by some wasm setups).
                 'Cross-Origin-Opener-Policy': 'same-origin',
                 'Cross-Origin-Embedder-Policy': 'require-corp',
             });
@@ -91,7 +105,6 @@ function analyzePng(buf) {
     };
 }
 
-// Mean absolute difference across RGB channels of two same-size PNG buffers.
 function meanAbsDiff(pngA, pngB) {
     if (pngA.width !== pngB.width || pngA.height !== pngB.height) {
         throw new Error(`size mismatch ${pngA.width}x${pngA.height} vs ${pngB.width}x${pngB.height}`);
@@ -107,15 +120,45 @@ function meanAbsDiff(pngA, pngB) {
     return sum / n;
 }
 
+// Loads the page at `${url}?${params}`, waits for first render, returns
+// canvas info + clip rect for screenshots.
+async function navigateAndWait(page, url, params) {
+    const target = params ? `${url}?${params}` : url;
+    await page.goto(target, { waitUntil: 'networkidle' });
+    await page.waitForTimeout(2500);
+
+    const info = await page.evaluate(() => {
+        const c = document.querySelector('canvas');
+        if (!c) return { exists: false };
+        const r = c.getBoundingClientRect();
+        return {
+            exists: true,
+            width: c.width, height: c.height,
+            rect: { x: r.x, y: r.y, w: r.width, h: r.height },
+        };
+    });
+    if (!info.exists || info.rect.w <= 0 || info.rect.h <= 0) {
+        throw new Error('canvas missing or zero-sized');
+    }
+    info.clip = {
+        x: Math.round(info.rect.x),
+        y: Math.round(info.rect.y),
+        width: Math.round(info.rect.w),
+        height: Math.round(info.rect.h),
+    };
+    return info;
+}
+
 async function main() {
     await ensureBuilt();
     await mkdir(OUT, { recursive: true });
+
+    const updateBaseline = process.env.UPDATE_BASELINE === '1';
 
     const { server, url } = await startServer();
     console.log(`serving ${DIST} at ${url}`);
 
     const browser = await chromium.launch({
-        // Try WebGPU first; fall back to WebGL2 if not available.
         args: [
             '--enable-unsafe-webgpu',
             '--enable-features=Vulkan',
@@ -137,26 +180,91 @@ async function main() {
     page.on('requestfailed', req =>
         consoleLog.push(`[netfail] ${req.url()} -> ${req.failure()?.errorText}`));
 
-    await page.goto(url, { waitUntil: 'networkidle' });
-    // Give wgpu a moment to spin up and render a few frames.
-    await page.waitForTimeout(2500);
+    const failures = [];
 
-    const canvasInfo = await page.evaluate(() => {
-        const c = document.querySelector('canvas');
-        if (!c) return { exists: false };
-        const r = c.getBoundingClientRect();
-        return {
-            exists: true,
-            width: c.width,
-            height: c.height,
-            clientWidth: c.clientWidth,
-            clientHeight: c.clientHeight,
-            inDom: document.contains(c),
-            display: getComputedStyle(c).display,
-            rect: { x: r.x, y: r.y, w: r.width, h: r.height },
-        };
-    });
+    // ------------------------------------------------------------------
+    // Phase A — pinned baseline (locked time + mouse)
+    // ------------------------------------------------------------------
+    const a = await navigateAndWait(page, url, BASELINE_PARAMS);
+    const lockedPath = join(OUT, 'locked.png');
+    const lockedBuf = await page.screenshot({ path: lockedPath, clip: a.clip });
+    const lockedStats = analyzePng(lockedBuf);
 
+    let baselineDiff = null;
+    if (updateBaseline) {
+        await writeFile(BASELINE_PATH, lockedBuf);
+        console.log(`wrote baseline → ${BASELINE_PATH}`);
+    } else {
+        let baselineBuf;
+        try {
+            baselineBuf = await readFile(BASELINE_PATH);
+        } catch {
+            failures.push(
+                `tests/baseline.png missing — run \`UPDATE_BASELINE=1 npm test\` to create it`,
+            );
+        }
+        if (baselineBuf) {
+            const baselinePng = PNG.sync.read(baselineBuf);
+            try {
+                baselineDiff = meanAbsDiff(baselinePng, lockedStats.png);
+            } catch (e) {
+                failures.push(`baseline size mismatch: ${e.message}`);
+            }
+        }
+    }
+
+    // Sanity: locked frame should still pass the brightness/range checks.
+    if (lockedStats.avgLuma < MIN_AVG_LUMA ||
+        (lockedStats.rangeR + lockedStats.rangeG + lockedStats.rangeB) < MIN_RGB_RANGE) {
+        failures.push(
+            `locked frame appears black/uniform ` +
+            `(avgLuma=${lockedStats.avgLuma.toFixed(2)}, ranges=${lockedStats.rangeR}/${lockedStats.rangeG}/${lockedStats.rangeB})`,
+        );
+    }
+
+    if (baselineDiff !== null && baselineDiff > MAX_BASELINE_DIFF) {
+        failures.push(
+            `pinned-baseline diff ${baselineDiff.toFixed(2)} > ${MAX_BASELINE_DIFF}/255 ` +
+            `(see tests/output/locked.png vs tests/baseline.png)`,
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Phase B — mouse API responsiveness (locked time only)
+    // ------------------------------------------------------------------
+    const b = await navigateAndWait(page, url, MOUSE_TEST_PARAMS);
+    const beforePath = join(OUT, 'before-mouse.png');
+    const beforeBuf = await page.screenshot({ path: beforePath, clip: b.clip });
+    const beforeStats = analyzePng(beforeBuf);
+
+    await page.mouse.move(b.rect.x + 80, b.rect.y + 80);
+    await page.waitForTimeout(400);
+    const afterPath = join(OUT, 'after-mouse.png');
+    const afterBuf = await page.screenshot({ path: afterPath, clip: b.clip });
+    const afterStats = analyzePng(afterBuf);
+    const mouseDiff = meanAbsDiff(beforeStats.png, afterStats.png);
+
+    if (mouseDiff < MIN_MOUSE_DIFF) {
+        failures.push(
+            `mouse API not affecting render: diff ${mouseDiff.toFixed(2)} < ${MIN_MOUSE_DIFF}/255 ` +
+            `(see tests/output/before-mouse.png vs after-mouse.png)`,
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Phase C — console-error gate (errors anywhere across the run)
+    // ------------------------------------------------------------------
+    await writeFile(join(OUT, 'console.log'), consoleLog.join('\n'));
+    const errorLines = consoleLog.filter(l =>
+        l.startsWith('[error]') || l.startsWith('[pageerror]') || l.startsWith('[netfail]')
+    );
+    if (errorLines.length > 0) {
+        failures.push(`${errorLines.length} console error(s):\n  ` + errorLines.slice(0, 5).join('\n  '));
+    }
+
+    // ------------------------------------------------------------------
+    // Diagnostics
+    // ------------------------------------------------------------------
     const gpuStatus = await page.evaluate(async () => {
         const out = { hasWebGPU: !!navigator.gpu, adapter: null };
         if (navigator.gpu) {
@@ -168,81 +276,30 @@ async function main() {
         return out;
     });
 
-    const fullScreenshotPath = join(OUT, 'screenshot.png');
-    await page.screenshot({ path: fullScreenshotPath, fullPage: false });
-
-    if (!canvasInfo.exists || canvasInfo.rect.w <= 0 || canvasInfo.rect.h <= 0) {
-        await writeFile(join(OUT, 'console.log'), consoleLog.join('\n'));
-        console.error('canvas not found or zero-sized; aborting');
-        await browser.close();
-        server.close();
-        process.exit(1);
-    }
-
-    const clip = {
-        x: Math.round(canvasInfo.rect.x),
-        y: Math.round(canvasInfo.rect.y),
-        width: Math.round(canvasInfo.rect.w),
-        height: Math.round(canvasInfo.rect.h),
-    };
-
-    // Baseline: cursor un-moved (state.mouse defaults to canvas center).
-    const baselinePath = join(OUT, 'canvas.png');
-    const baselineBuf = await page.screenshot({ path: baselinePath, clip });
-    const stats = analyzePng(baselineBuf);
-
-    // Mouse-API check: move cursor near top-left of the canvas. The
-    // mandelbrot's center should track the cursor, so the rendered image
-    // should differ noticeably from the baseline.
-    await page.mouse.move(canvasInfo.rect.x + 80, canvasInfo.rect.y + 80);
-    await page.waitForTimeout(400);
-    const mousedPath = join(OUT, 'canvas-mouse.png');
-    const mousedBuf = await page.screenshot({ path: mousedPath, clip });
-    const mousedStats = analyzePng(mousedBuf);
-    const mouseDiff = meanAbsDiff(stats.png, mousedStats.png);
-
-    await writeFile(join(OUT, 'console.log'), consoleLog.join('\n'));
-
-    const { png: _p1, ...statsLog }       = stats;
-    const { png: _p2, ...mousedStatsLog } = mousedStats;
-
+    const stripPng = ({ png, ...rest }) => rest;
     console.log('\n=== diagnostics ===');
-    console.log('canvas:        ', canvasInfo);
     console.log('gpu:           ', gpuStatus);
-    console.log('baseline image:', statsLog);
-    console.log('after mouse:   ', mousedStatsLog);
-    console.log(`mouse-move mean abs diff: ${mouseDiff.toFixed(2)}/255`);
-    console.log(`baseline screenshot:  ${baselinePath}`);
-    console.log(`after-mouse screenshot: ${mousedPath}`);
-    console.log(`console (${consoleLog.length} lines): tests/output/console.log`);
-    if (consoleLog.length) {
-        console.log('--- console (first 30 lines) ---');
-        consoleLog.slice(0, 30).forEach(l => console.log('  ' + l));
-    }
+    console.log('locked frame:  ', stripPng(lockedStats));
+    console.log('after-mouse:   ', stripPng(afterStats));
+    console.log(`baseline diff:  ${baselineDiff === null ? '(skipped)' : baselineDiff.toFixed(2) + '/255'}`);
+    console.log(`mouse diff:     ${mouseDiff.toFixed(2)}/255`);
+    console.log(`outputs:        tests/output/{locked,before-mouse,after-mouse}.png`);
+    console.log(`console:        ${consoleLog.length} lines → tests/output/console.log`);
 
     await browser.close();
     server.close();
 
-    const MIN_AVG = 8;          // any visible content beats pure black
-    const MIN_RANGE = 30;       // non-uniform color implies mandelbrot is rendering
-    // Time-based color/zoom drift between two ~400ms screenshots is well
-    // under 10/255 mean abs diff; threshold of 12 leaves margin while still
-    // catching a mouse-uniform that doesn't actually translate the image.
-    const MIN_MOUSE_DIFF = 12;
-
-    const renderingOk = stats.avgLuma >= MIN_AVG &&
-                        (stats.rangeR + stats.rangeG + stats.rangeB) >= MIN_RANGE;
-    const mouseOk = mouseDiff >= MIN_MOUSE_DIFF;
-
-    if (!renderingOk) {
-        console.error(`\n✗ canvas appears black/uniform (avgLuma=${stats.avgLuma.toFixed(2)}, ranges=${stats.rangeR}/${stats.rangeG}/${stats.rangeB})`);
+    if (failures.length > 0) {
+        console.error('\n✗ FAIL:');
+        failures.forEach(f => console.error('  - ' + f));
         process.exit(1);
     }
-    if (!mouseOk) {
-        console.error(`\n✗ mouse API not affecting render (mean abs diff ${mouseDiff.toFixed(2)} < ${MIN_MOUSE_DIFF})`);
-        process.exit(1);
+
+    if (updateBaseline) {
+        console.log('\n✓ baseline updated; commit tests/baseline.png');
+    } else {
+        console.log('\n✓ all checks passed');
     }
-    console.log(`\n✓ rendering ok (avgLuma=${stats.avgLuma.toFixed(2)}), mouse responsive (diff=${mouseDiff.toFixed(2)})`);
 }
 
 main().catch(e => {

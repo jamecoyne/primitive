@@ -20,31 +20,39 @@ exactly or the wasm fails to load.
 ## Screenshot test (web)
 
 ```
-npm test
+npm test                       # run all checks
+UPDATE_BASELINE=1 npm test     # regenerate tests/baseline.png
 ```
 
-Runs `tests/screenshot.mjs`:
+`tests/screenshot.mjs` runs three checks. Always rebuild via `./build-web.sh`
+first; the test reads `web/dist/`.
 
-1. Serves `web/dist/` in-process on a random port.
-2. Launches headless Chromium via Playwright with WebGPU enabled
-   (`--enable-unsafe-webgpu --use-angle=metal`).
-3. Waits ~2.5 s for wasm init + first frames, then screenshots **only the
-   canvas region** (cropped via `getBoundingClientRect`) — the page chrome
-   would otherwise mask a fully-black canvas and hide bugs.
-4. Parses the PNG with `pngjs` and asserts:
-   - `avgLuma ≥ 8` (catches all-black canvas)
-   - combined RGB range `≥ 30` (catches uniform-color canvas)
-5. Moves the cursor to a different canvas location, screenshots again, and
-   asserts mean abs RGB diff `≥ 12/255`. The mandelbrot's center tracks the
-   cursor (see GLSL fragment shader), so a working mouse API moves the image
-   substantially; the threshold sits comfortably above time-based color/zoom
-   drift between two ~400ms screenshots.
+1. **Pinned-baseline diff.** Loads `?t=2.5&mx=0.5&my=0.5` — those URL params
+   are read by `parse_test_lock_from_url()` in `lib.rs` and freeze the time
+   uniform + pin the cursor. The locked frame is mean-abs-diffed against
+   `tests/baseline.png` (committed); fail threshold `8/255`. WebGPU is
+   deterministic on the same machine — actual diff is `0.00/255`. Bump the
+   threshold if you observe drift across machines.
+2. **Mouse-API responsiveness.** Loads `?t=2.5` (time locked, mouse free),
+   takes a screenshot, moves the cursor, takes another. Mean abs diff must be
+   `≥ 12/255`. Time lock means the diff reflects only the cursor move, not
+   color/zoom drift.
+3. **Console-error gate.** Any `[error]`, `[pageerror]`, or `[netfail]` line
+   collected during the run fails the test. This catches things like the
+   wgpu 22 `maxInterStageShaderComponents` panic the moment they appear,
+   without needing to reason about pixel statistics.
 
-Diagnostics on every run:
-- `tests/output/canvas.png` — baseline canvas screenshot (cursor at default)
-- `tests/output/canvas-mouse.png` — after cursor moved
-- `tests/output/screenshot.png` — full-page screenshot
-- `tests/output/console.log` — browser console + page errors + failed requests
+Sanity bounds (`avgLuma ≥ 8`, combined RGB range `≥ 30`) still apply to the
+locked frame as a black/uniform-color guard.
+
+Outputs (always written to `tests/output/`, gitignored):
+- `locked.png` — pinned-baseline frame.
+- `before-mouse.png` / `after-mouse.png` — mouse-API frames.
+- `console.log` — full browser console + pageerror + netfail capture.
+
+When you intentionally change rendering (shader edit, surface format, etc.),
+run `UPDATE_BASELINE=1 npm test`, eyeball the new `tests/baseline.png`, and
+commit it.
 
 Always rebuild with `./build-web.sh` before `npm test`; the test reads the
 last-built `web/dist/` and will fail with exit 2 if the build is missing.

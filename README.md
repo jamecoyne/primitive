@@ -5,7 +5,7 @@ set with a GLSL fragment shader and runs from the same source on **native
 macOS** and **the browser** (compiled to WebAssembly via `wasm-bindgen`). The
 mandelbrot's center tracks the cursor.
 
-![mandelbrot screenshot](tests/output/canvas.png)
+![mandelbrot screenshot](tests/baseline.png)
 
 ## Architecture
 
@@ -53,18 +53,20 @@ npm test
 ```
 
 `tests/screenshot.mjs` boots a Node http server for `web/dist/`, launches
-headless Chromium with WebGPU enabled, screenshots the canvas, and asserts:
+headless Chromium with WebGPU enabled, and runs three checks:
 
-1. The canvas isn't black or solid-coloured (avg luma + RGB range).
-2. Moving the cursor changes the rendered image (mean abs RGB diff). This
-   exercises the mouse uniform end-to-end.
+1. **Pinned-baseline diff.** Loads with `?t=2.5&mx=0.5&my=0.5` — URL params
+   the wasm reads to freeze `time` and pin the cursor — and mean-abs-diffs
+   the locked frame against `tests/baseline.png`. Catches shader regressions
+   and surface format drift.
+2. **Mouse-API responsiveness.** With time still locked, screenshots before
+   and after `page.mouse.move(...)` and asserts the image moved.
+3. **Console-error gate.** Any `[error]` / `[pageerror]` / `[netfail]` line
+   fails the test outright.
 
-Diagnostics are written to `tests/output/`:
-
-- `canvas.png` — baseline frame (cursor at default position).
-- `canvas-mouse.png` — frame after `page.mouse.move(...)`.
-- `screenshot.png` — full page.
-- `console.log` — browser console + page errors.
+Run `UPDATE_BASELINE=1 npm test` after intentional rendering changes to
+regenerate `tests/baseline.png`. Diagnostics for each run land in
+`tests/output/`.
 
 ## Project layout
 

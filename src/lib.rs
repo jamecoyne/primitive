@@ -20,6 +20,16 @@ struct Uniforms {
     _pad: [f32; 3],
 }
 
+/// Test-mode overrides parsed from URL params on web. None on native.
+/// When `time` is Some, the time uniform is frozen at that value. When
+/// `mouse_uv` is Some, the cursor is pinned and CursorMoved events are
+/// ignored — used by the screenshot harness to render deterministic frames.
+#[derive(Clone, Copy, Default)]
+struct TestLock {
+    time: Option<f32>,
+    mouse_uv: Option<[f32; 2]>,
+}
+
 struct State {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -33,10 +43,15 @@ struct State {
     // Cursor position in physical pixels (winit y-down). Defaults to canvas
     // center so the first frame matches the no-cursor case.
     mouse: [f32; 2],
+    lock: TestLock,
 }
 
 impl State {
-    async fn new(window: Arc<Window>, initial_size: PhysicalSize<u32>) -> Self {
+    async fn new(
+        window: Arc<Window>,
+        initial_size: PhysicalSize<u32>,
+        lock: TestLock,
+    ) -> Self {
         let size = PhysicalSize::new(initial_size.width.max(1), initial_size.height.max(1));
         log::info!("State::new size = {:?}", size);
 
@@ -182,7 +197,11 @@ impl State {
             cache: None,
         });
 
-        let mouse = [size.width as f32 * 0.5, size.height as f32 * 0.5];
+        let default_mouse = [size.width as f32 * 0.5, size.height as f32 * 0.5];
+        let mouse = match lock.mouse_uv {
+            Some([u, v]) => [u * size.width as f32, v * size.height as f32],
+            None => default_mouse,
+        };
         Self {
             window,
             surface,
@@ -194,6 +213,7 @@ impl State {
             bind_group,
             start: web_time::Instant::now(),
             mouse,
+            lock,
         }
     }
 
@@ -212,10 +232,14 @@ impl State {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        let time = self
+            .lock
+            .time
+            .unwrap_or_else(|| self.start.elapsed().as_secs_f32());
         let uniforms = Uniforms {
             resolution: [self.config.width as f32, self.config.height as f32],
             mouse: self.mouse,
-            time: self.start.elapsed().as_secs_f32(),
+            time,
             _pad: [0.0; 3],
         };
         self.queue
@@ -268,6 +292,37 @@ struct App {
     #[allow(dead_code)] // only used on wasm32 to deliver async-built State
     proxy: Option<EventLoopProxy<UserEvent>>,
     state: Option<State>,
+    lock: TestLock,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_test_lock_from_url() -> TestLock {
+    let Some(window) = web_sys::window() else {
+        return TestLock::default();
+    };
+    let Ok(search) = window.location().search() else {
+        return TestLock::default();
+    };
+    let qs = search.trim_start_matches('?');
+    let (mut t, mut mx, mut my) = (None, None, None);
+    for kv in qs.split('&') {
+        let mut split = kv.splitn(2, '=');
+        let k = split.next().unwrap_or("");
+        let v = split.next().unwrap_or("");
+        match k {
+            "t" => t = v.parse::<f32>().ok(),
+            "mx" => mx = v.parse::<f32>().ok(),
+            "my" => my = v.parse::<f32>().ok(),
+            _ => {}
+        }
+    }
+    TestLock {
+        time: t,
+        mouse_uv: match (mx, my) {
+            (Some(x), Some(y)) => Some([x, y]),
+            _ => None,
+        },
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -304,19 +359,21 @@ impl ApplicationHandler<UserEvent> for App {
                 .expect("failed to create window"),
         );
 
+        let lock = self.lock;
+
         #[cfg(target_arch = "wasm32")]
         {
             let proxy = self.proxy.take().expect("proxy taken");
             let window_clone = window.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let state = State::new(window_clone, initial_size).await;
+                let state = State::new(window_clone, initial_size, lock).await;
                 let _ = proxy.send_event(UserEvent::StateReady(state));
             });
         }
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let state = pollster::block_on(State::new(window, initial_size));
+            let state = pollster::block_on(State::new(window, initial_size, lock));
             self.state = Some(state);
         }
     }
@@ -346,7 +403,9 @@ impl ApplicationHandler<UserEvent> for App {
                 state.window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
-                state.mouse = [position.x as f32, position.y as f32];
+                if state.lock.mouse_uv.is_none() {
+                    state.mouse = [position.x as f32, position.y as f32];
+                }
             }
             WindowEvent::RedrawRequested => {
                 match state.render() {
@@ -370,10 +429,25 @@ pub fn run() {
         .build()
         .expect("event loop");
     let proxy = event_loop.create_proxy();
+
+    #[cfg(target_arch = "wasm32")]
+    let lock = parse_test_lock_from_url();
+    #[cfg(not(target_arch = "wasm32"))]
+    let lock = TestLock::default();
+
+    if lock.time.is_some() || lock.mouse_uv.is_some() {
+        log::info!(
+            "test lock: time={:?}, mouse_uv={:?}",
+            lock.time,
+            lock.mouse_uv
+        );
+    }
+
     #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
     let mut app = App {
         proxy: Some(proxy),
         state: None,
+        lock,
     };
 
     #[cfg(not(target_arch = "wasm32"))]
