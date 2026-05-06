@@ -10,8 +10,8 @@ the web entry point.
 | Target | Command | Notes |
 |---|---|---|
 | Native (Mac) | `cargo run --release` | Metal backend, opens a winit window |
-| Web | `./build-web.sh` | Outputs to `web/dist/` |
-| Serve web build | `cd web/dist && python3 -m http.server 8000` | Then open http://localhost:8000 |
+| Web (one-liner) | `npm run dev:web` | Builds, serves on `http://127.0.0.1:8000`, opens default browser. `PORT=...` to override; falls through to next free port if taken. |
+| Web (manual) | `./build-web.sh` then `cd web/dist && python3 -m http.server 8000` | Use this when you don't want a browser tab to open. |
 
 `build-web.sh` reads the `wasm-bindgen` version from `Cargo.lock` and
 auto-installs a matching `wasm-bindgen-cli` if needed. Versions must match
