@@ -5,6 +5,12 @@ browser (WASM). Single crate, both targets share `src/lib.rs`; `src/main.rs` is
 the native entry point and `web_main()` (annotated `#[wasm_bindgen(start)]`) is
 the web entry point.
 
+The shader pipeline runs through a small render graph (`src/render_graph.rs`)
+loaded from `config/graph.toml` at compile time. v1 supports only a single
+fragment-shader node (the mandelbrot) and exists primarily as scaffolding —
+the chaining/intermediate-texture path is gated behind a check that rejects
+non-empty `inputs` until the second node type lands.
+
 ## Build & run
 
 | Target | Command | Notes |

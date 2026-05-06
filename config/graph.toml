@@ -1,0 +1,20 @@
+# Render-graph definition. Loaded at compile time via include_str! so the
+# binary stays self-contained on both native and wasm.
+#
+# Schema (per [[node]] entry):
+#   id        : unique string identifier
+#   kind      : node type — currently only "mandelbrot" is implemented
+#   inputs    : array of upstream node ids whose outputs feed this node
+#   present   : if true, this node renders to the swapchain (surface) view
+#               instead of an intermediate texture; exactly one node must
+#               have `present = true`
+#
+# v1 only supports a single mandelbrot node with no inputs. Adding a
+# second node type (e.g. a post-process pass) will exercise the inputs/
+# chaining path of the graph.
+
+[[node]]
+id = "mandelbrot"
+kind = "mandelbrot"
+inputs = []
+present = true
