@@ -5,10 +5,11 @@
   "scripts": {
     "dev:native": "cargo run --release",
     "dev:web": "node tools/dev-serve.mjs",
-    "test": "npm run test:native && npm run test:web && npm run test:cross",
+    "test": "npm run test:native && npm run test:web && npm run test:cross && npm run test:responsive",
     "test:native": "cargo test --test headless",
     "test:web": "./build-web.sh && node tests/screenshot.mjs",
-    "test:cross": "node tests/cross_platform.mjs"
+    "test:cross": "node tests/cross_platform.mjs",
+    "test:responsive": "node tests/responsive.mjs"
   },
   "devDependencies": {
     "playwright": "^1.49.0",
