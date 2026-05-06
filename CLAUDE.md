@@ -17,15 +17,41 @@ the web entry point.
 auto-installs a matching `wasm-bindgen-cli` if needed. Versions must match
 exactly or the wasm fails to load.
 
-## Screenshot test (web)
+## Test harness
 
 ```
-npm test                       # run all checks
-UPDATE_BASELINE=1 npm test     # regenerate tests/baseline.png
+npm test                          # native + web
+npm run test:native               # cargo test (~0.05s after compile)
+npm run test:web                  # ./build-web.sh + screenshot harness
+UPDATE_BASELINE=1 npm test        # regenerate both baselines
 ```
 
-`tests/screenshot.mjs` runs three checks. Always rebuild via `./build-web.sh`
-first; the test reads `web/dist/`.
+The native and web halves use the same three checks (pinned baseline,
+mouse responsiveness, error gate) but each maintains its **own** baseline
+image because the rendering paths differ — native goes naga→MSL via Metal,
+web goes naga→WGSL via the browser, and they produce subtly different
+floats. Don't try to share `tests/baseline.png` and `tests/baseline-native.png`.
+
+### Native (`tests/headless.rs`, `cargo test`)
+
+`wgpuweb::render_offscreen(RenderConfig { width, height, time, mouse_uv })`
+is a public lib function that builds a wgpu instance with no surface,
+renders one frame to an `Rgba8UnormSrgb` texture, copies to a staging buffer,
+and returns tightly-packed RGBA8. `tests/headless.rs` uses it for:
+
+1. `pinned_baseline` — diff vs `tests/baseline-native.png` ≤ 8/255.
+2. `mouse_changes_image` — render at `mouse_uv [0.5, 0.5]` and `[0.1, 0.1]`,
+   assert diff ≥ 12/255.
+3. Panic gate is implicit — `cargo test` fails on any panic during render
+   setup, equivalent to the browser's console-error gate.
+
+`UPDATE_BASELINE=1 cargo test --test headless pinned_baseline` regenerates
+the file. Commit it.
+
+### Web (`tests/screenshot.mjs`, Playwright)
+
+`tests/screenshot.mjs` runs three checks. `npm run test:web` rebuilds the
+wasm first; if invoking the script directly, run `./build-web.sh` first.
 
 1. **Pinned-baseline diff.** Loads `?t=2.5&mx=0.5&my=0.5` — those URL params
    are read by `parse_test_lock_from_url()` in `lib.rs` and freeze the time

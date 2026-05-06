@@ -3,7 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node tests/screenshot.mjs"
+    "test": "npm run test:native && npm run test:web",
+    "test:native": "cargo test --test headless",
+    "test:web": "./build-web.sh && node tests/screenshot.mjs"
   },
   "devDependencies": {
     "playwright": "^1.49.0",

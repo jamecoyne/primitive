@@ -44,29 +44,36 @@ cd web/dist && python3 -m http.server 8000
 `wasm-bindgen-cli` whose version matches the `wasm-bindgen` crate in
 `Cargo.lock` (the two must match exactly).
 
-## Headless screenshot test
+## Test harness
 
 ```sh
-npm install     # one-time
-npx playwright install chromium
-npm test
+npm install                        # one-time
+npx playwright install chromium    # one-time
+npm test                           # native + web
+npm run test:native                # cargo test (~0.05s after compile)
+npm run test:web                   # rebuild wasm + Playwright screenshot
 ```
 
-`tests/screenshot.mjs` boots a Node http server for `web/dist/`, launches
-headless Chromium with WebGPU enabled, and runs three checks:
+Native and web run the same three checks against their own platform's
+rendering pipeline:
 
-1. **Pinned-baseline diff.** Loads with `?t=2.5&mx=0.5&my=0.5` — URL params
-   the wasm reads to freeze `time` and pin the cursor — and mean-abs-diffs
-   the locked frame against `tests/baseline.png`. Catches shader regressions
-   and surface format drift.
-2. **Mouse-API responsiveness.** With time still locked, screenshots before
-   and after `page.mouse.move(...)` and asserts the image moved.
-3. **Console-error gate.** Any `[error]` / `[pageerror]` / `[netfail]` line
-   fails the test outright.
+1. **Pinned-baseline diff.** A locked input (`time = 2.5`, `mouse_uv = (0.5, 0.5)`)
+   should produce a deterministic frame. Mean abs RGB diff must be ≤ 8/255
+   vs `tests/baseline.png` (web, browser screenshot) or
+   `tests/baseline-native.png` (native, `render_offscreen` readback). Catches
+   shader regressions and surface-format drift.
+2. **Mouse-API responsiveness.** Image must change by ≥ 12/255 when the
+   cursor moves — proves the mouse uniform is plumbed through.
+3. **Error gate.** Web fails on any `[error]` / `[pageerror]` / `[netfail]`;
+   native fails on any panic via `cargo test`. Mostly catches naga
+   translation errors and validation panics the moment they appear.
 
-Run `UPDATE_BASELINE=1 npm test` after intentional rendering changes to
-regenerate `tests/baseline.png`. Diagnostics for each run land in
-`tests/output/`.
+Each platform keeps a separate baseline image because the rendering paths
+differ — native is naga→MSL via Metal, browser is naga→WGSL via WebGPU —
+and the float results are subtly different. Run `UPDATE_BASELINE=1 npm test`
+after intentional rendering changes and commit both baselines.
+
+Diagnostics for the web run land in `tests/output/`.
 
 ## Project layout
 

@@ -30,15 +30,113 @@ struct TestLock {
     mouse_uv: Option<[f32; 2]>,
 }
 
+/// Pipeline + uniform buffer + bind group for the mandelbrot. Holds nothing
+/// surface-specific so it can be reused by the offscreen render path used in
+/// native tests. Created once per device.
+struct Renderer {
+    pipeline: wgpu::RenderPipeline,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+fn create_renderer(device: &wgpu::Device, format: wgpu::TextureFormat) -> Renderer {
+    // GLSL → naga → backend SPIR-V/MSL/WGSL/GLSL ES.
+    let vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("mandelbrot.vert"),
+        source: wgpu::ShaderSource::Glsl {
+            shader: include_str!("../shaders/mandelbrot.vert").into(),
+            stage: wgpu::naga::ShaderStage::Vertex,
+            defines: Default::default(),
+        },
+    });
+    let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("mandelbrot.frag"),
+        source: wgpu::ShaderSource::Glsl {
+            shader: include_str!("../shaders/mandelbrot.frag").into(),
+            stage: wgpu::naga::ShaderStage::Fragment,
+            defines: Default::default(),
+        },
+    });
+
+    let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("uniforms"),
+        size: std::mem::size_of::<Uniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("bind-layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("bind-group"),
+        layout: &bind_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform_buffer.as_entire_binding(),
+        }],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("pipeline-layout"),
+        bind_group_layouts: &[&bind_layout],
+        push_constant_ranges: &[],
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("mandelbrot-pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &vs,
+            entry_point: Some("main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &fs,
+            entry_point: Some("main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    });
+
+    Renderer {
+        pipeline,
+        uniform_buffer,
+        bind_group,
+    }
+}
+
 struct State {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    pipeline: wgpu::RenderPipeline,
-    uniform_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
+    renderer: Renderer,
     start: web_time::Instant,
     // Cursor position in physical pixels (winit y-down). Defaults to canvas
     // center so the first frame matches the no-cursor case.
@@ -114,88 +212,7 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        // GLSL → naga → backend SPIR-V/MSL/GLSL ES.
-        let vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mandelbrot.vert"),
-            source: wgpu::ShaderSource::Glsl {
-                shader: include_str!("../shaders/mandelbrot.vert").into(),
-                stage: wgpu::naga::ShaderStage::Vertex,
-                defines: Default::default(),
-            },
-        });
-        let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mandelbrot.frag"),
-            source: wgpu::ShaderSource::Glsl {
-                shader: include_str!("../shaders/mandelbrot.frag").into(),
-                stage: wgpu::naga::ShaderStage::Fragment,
-                defines: Default::default(),
-            },
-        });
-
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("uniforms"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("bind-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bind-group"),
-            layout: &bind_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("pipeline-layout"),
-            bind_group_layouts: &[&bind_layout],
-            push_constant_ranges: &[],
-        });
-
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mandelbrot-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &vs,
-                entry_point: Some("main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &fs,
-                entry_point: Some("main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+        let renderer = create_renderer(&device, format);
 
         let default_mouse = [size.width as f32 * 0.5, size.height as f32 * 0.5];
         let mouse = match lock.mouse_uv {
@@ -208,9 +225,7 @@ impl State {
             device,
             queue,
             config,
-            pipeline,
-            uniform_buffer,
-            bind_group,
+            renderer,
             start: web_time::Instant::now(),
             mouse,
             lock,
@@ -243,7 +258,7 @@ impl State {
             _pad: [0.0; 3],
         };
         self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+            .write_buffer(&self.renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
         let mut encoder = self
             .device
@@ -265,8 +280,8 @@ impl State {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_pipeline(&self.renderer.pipeline);
+            pass.set_bind_group(0, &self.renderer.bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
         self.queue.submit(Some(encoder.finish()));
@@ -466,4 +481,158 @@ pub fn web_main() {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
     let _ = console_log::init_with_level(log::Level::Info);
     run();
+}
+
+/// Locked inputs for a single offscreen frame. `time` is the value the
+/// fragment shader sees in `u.time`; `mouse_uv` is the cursor in
+/// normalized canvas coordinates (top-left origin, matches the `mx`/`my`
+/// URL params on web).
+#[derive(Clone, Copy, Debug)]
+pub struct RenderConfig {
+    pub width: u32,
+    pub height: u32,
+    pub time: f32,
+    pub mouse_uv: [f32; 2],
+}
+
+/// Render exactly one frame to an offscreen `Rgba8UnormSrgb` texture and
+/// return the pixels as tightly-packed RGBA8 bytes (length = width * height * 4).
+/// Used by the native test harness to mirror the deterministic-frame check
+/// the browser test does. No surface, no event loop — just the pipeline.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn render_offscreen(cfg: RenderConfig) -> Vec<u8> {
+    assert!(cfg.width > 0 && cfg.height > 0);
+
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..Default::default()
+    });
+
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })
+        .await
+        .expect("offscreen: no adapter");
+
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("offscreen-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::default(),
+            },
+            None,
+        )
+        .await
+        .expect("offscreen: request_device");
+
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let renderer = create_renderer(&device, format);
+
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("offscreen-target"),
+        size: wgpu::Extent3d {
+            width: cfg.width,
+            height: cfg.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let uniforms = Uniforms {
+        resolution: [cfg.width as f32, cfg.height as f32],
+        mouse: [
+            cfg.mouse_uv[0] * cfg.width as f32,
+            cfg.mouse_uv[1] * cfg.height as f32,
+        ],
+        time: cfg.time,
+        _pad: [0.0; 3],
+    };
+    queue.write_buffer(&renderer.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+    // wgpu's copy_texture_to_buffer requires bytes_per_row to be a multiple
+    // of 256. We pad in the staging buffer and strip the padding on readback.
+    const BYTES_PER_PIXEL: u32 = 4;
+    let unpadded_bpr = cfg.width * BYTES_PER_PIXEL;
+    let padded_bpr =
+        (unpadded_bpr + wgpu::COPY_BYTES_PER_ROW_ALIGNMENT - 1) / wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("offscreen-readback"),
+        size: (padded_bpr * cfg.height) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("offscreen-encoder"),
+    });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("offscreen-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&renderer.pipeline);
+        pass.set_bind_group(0, &renderer.bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &staging,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bpr),
+                rows_per_image: Some(cfg.height),
+            },
+        },
+        wgpu::Extent3d {
+            width: cfg.width,
+            height: cfg.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+    device.poll(wgpu::Maintain::Wait);
+    rx.recv().unwrap().expect("buffer map failed");
+
+    let padded = slice.get_mapped_range();
+    let mut out = Vec::with_capacity((unpadded_bpr * cfg.height) as usize);
+    for row in 0..cfg.height {
+        let start = (row * padded_bpr) as usize;
+        out.extend_from_slice(&padded[start..start + unpadded_bpr as usize]);
+    }
+    drop(padded);
+    staging.unmap();
+    out
 }
