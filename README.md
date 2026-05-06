@@ -32,7 +32,7 @@ mandelbrot's center tracks the cursor.
 ### Native (macOS, Metal)
 
 ```sh
-cargo run --release
+npm run dev:native     # or, equivalently, `cargo run --release`
 ```
 
 ### Web (WebGPU, with WebGL2 fallback)
