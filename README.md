@@ -104,8 +104,9 @@ CLAUDE.md            # operating notes for Claude Code (build commands, gotchas)
 - **wgpu must be ≥24.** wgpu 22 sends the now-removed WebGPU spec field
   `maxInterStageShaderComponents`, which modern Chromium rejects at
   `requestDevice`.
-- **The web canvas must already exist in the DOM with explicit `width`/`height`
-  attributes** before winit binds to it. `winit::Window::inner_size()` on web
-  races browser layout and returns 0×0 right after `create_window`, which would
-  silently produce a 1×1 surface that CSS scales up to look correctly sized but
-  renders only one fragment-shader sample.
+- **The web canvas's drawing-buffer dimensions must be set in JS before
+  the wasm reads them.** `index.html`'s inline script does
+  `c.width = window.innerWidth; c.height = window.innerHeight` before
+  `await init()`. Without this `winit::Window::inner_size()` races browser
+  layout and returns 0×0, which previously produced a 1×1 surface that CSS
+  scaled up to look right but rendered only one fragment-shader sample.

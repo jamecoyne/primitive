@@ -266,6 +266,12 @@ impl State {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
+        // When the cursor is pinned via test lock, keep it pinned in uv space
+        // even as the canvas resizes — otherwise locked-frame screenshots
+        // would drift after the first ResizeObserver event on web.
+        if let Some([u, v]) = self.lock.mouse_uv {
+            self.mouse = [u * size.width as f32, v * size.height as f32];
+        }
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
