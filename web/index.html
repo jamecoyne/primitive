@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Mandelbrot — wgpu / wasm</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #0a0a0a;
+    color: #ddd;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    overflow: hidden;
+  }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas#wgpu {
+    display: block;
+    width: 960px;
+    height: 720px;
+    box-shadow: 0 0 80px rgba(255,128,32,0.15);
+  }
+  #status {
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    padding: 6px 12px;
+    font-size: 12px;
+    background: rgba(0,0,0,0.6);
+    border-top: 1px solid #222;
+  }
+</style>
+</head>
+<body>
+  <canvas id="wgpu" width="960" height="720"></canvas>
+  <div id="status">loading wasm…</div>
+  <script type="module">
+    import init from './wgpuweb.js';
+    const status = document.getElementById('status');
+    try {
+      await init();
+      const backend = navigator.gpu ? 'WebGPU' : 'WebGL2 (fallback)';
+      status.textContent = `running — backend: ${backend}`;
+    } catch (e) {
+      status.textContent = `error: ${e}`;
+      console.error(e);
+    }
+  </script>
+</body>
+</html>
