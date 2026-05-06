@@ -137,11 +137,26 @@ struct State {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     renderer: Renderer,
+    // Format used for the render-pass color attachment. May differ from
+    // config.format: on web the WebGPU canvas only accepts non-sRGB
+    // storage formats, so we render through an sRGB view of the canvas
+    // texture to keep the linear→sRGB encoding consistent with native.
+    view_format: wgpu::TextureFormat,
     start: web_time::Instant,
-    // Cursor position in physical pixels (winit y-down). Defaults to canvas
-    // center so the first frame matches the no-cursor case.
     mouse: [f32; 2],
     lock: TestLock,
+}
+
+/// Returns the sRGB-encoding sibling of a format if one exists, else the
+/// format itself. Lets us write linear shader output through an sRGB view
+/// even when the underlying canvas storage is non-sRGB.
+fn srgb_view_of(format: wgpu::TextureFormat) -> wgpu::TextureFormat {
+    use wgpu::TextureFormat::*;
+    match format {
+        Bgra8Unorm => Bgra8UnormSrgb,
+        Rgba8Unorm => Rgba8UnormSrgb,
+        other => other,
+    }
 }
 
 impl State {
@@ -193,26 +208,37 @@ impl State {
             .expect("request_device");
 
         let caps = surface.get_capabilities(&adapter);
-        let format = caps
+        // Prefer an sRGB storage format; if none (WebGPU canvases on Chrome
+        // expose only Bgra8Unorm/Rgba8Unorm), keep the non-sRGB storage and
+        // we'll render through an sRGB view below to keep linear→sRGB
+        // encoding consistent across platforms.
+        let storage_format = caps
             .formats
             .iter()
             .copied()
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
+        let view_format = srgb_view_of(storage_format);
+
+        let view_formats = if storage_format != view_format {
+            vec![view_format]
+        } else {
+            vec![]
+        };
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
+            format: storage_format,
             width: size.width,
             height: size.height,
             present_mode: caps.present_modes[0],
             alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
+            view_formats,
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
 
-        let renderer = create_renderer(&device, format);
+        let renderer = create_renderer(&device, view_format);
 
         let default_mouse = [size.width as f32 * 0.5, size.height as f32 * 0.5];
         let mouse = match lock.mouse_uv {
@@ -226,6 +252,7 @@ impl State {
             queue,
             config,
             renderer,
+            view_format,
             start: web_time::Instant::now(),
             mouse,
             lock,
@@ -243,9 +270,10 @@ impl State {
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let frame = self.surface.get_current_texture()?;
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.view_format),
+            ..Default::default()
+        });
 
         let time = self
             .lock

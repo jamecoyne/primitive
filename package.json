@@ -3,9 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "npm run test:native && npm run test:web",
+    "test": "npm run test:native && npm run test:web && npm run test:cross",
     "test:native": "cargo test --test headless",
-    "test:web": "./build-web.sh && node tests/screenshot.mjs"
+    "test:web": "./build-web.sh && node tests/screenshot.mjs",
+    "test:cross": "node tests/cross_platform.mjs"
   },
   "devDependencies": {
     "playwright": "^1.49.0",

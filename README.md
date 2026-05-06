@@ -49,9 +49,10 @@ cd web/dist && python3 -m http.server 8000
 ```sh
 npm install                        # one-time
 npx playwright install chromium    # one-time
-npm test                           # native + web
-npm run test:native                # cargo test (~0.05s after compile)
+npm test                           # native + web + cross-platform diff
+npm run test:native                # cargo test --test headless
 npm run test:web                   # rebuild wasm + Playwright screenshot
+npm run test:cross                 # strict pixel-perfect cross-platform diff
 ```
 
 Native and web run the same three checks against their own platform's
@@ -68,12 +69,17 @@ rendering pipeline:
    native fails on any panic via `cargo test`. Mostly catches naga
    translation errors and validation panics the moment they appear.
 
-Each platform keeps a separate baseline image because the rendering paths
-differ — native is naga→MSL via Metal, browser is naga→WGSL via WebGPU —
-and the float results are subtly different. Run `UPDATE_BASELINE=1 npm test`
-after intentional rendering changes and commit both baselines.
+Each platform has its own baseline. They render byte-identical pixels at
+the same locked input — verified by `npm run test:cross`, which
+strict-compares the native `render_offscreen` readback against the web
+canvas screenshot and fails on any single pixel diff. Achieving zero diff
+required two non-obvious fixes: configuring the surface with an sRGB view
+format on web (Chrome only exposes non-sRGB storage formats), and
+suppressing the browser-injected canvas focus outline before screenshot.
+See `CLAUDE.md` for details.
 
-Diagnostics for the web run land in `tests/output/`.
+Run `UPDATE_BASELINE=1 npm test` after intentional rendering changes and
+commit both baselines. Diagnostics for the web runs land in `tests/output/`.
 
 ## Project layout
 

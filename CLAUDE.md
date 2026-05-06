@@ -20,17 +20,19 @@ exactly or the wasm fails to load.
 ## Test harness
 
 ```
-npm test                          # native + web
-npm run test:native               # cargo test (~0.05s after compile)
-npm run test:web                  # ./build-web.sh + screenshot harness
-UPDATE_BASELINE=1 npm test        # regenerate both baselines
+npm test                          # native + web + cross-platform
+npm run test:native               # cargo test --test headless
+npm run test:web                  # ./build-web.sh + Playwright screenshot harness
+npm run test:cross                # strict pixel-perfect cross-platform diff
+UPDATE_BASELINE=1 npm test        # regenerate native + web baselines
 ```
 
-The native and web halves use the same three checks (pinned baseline,
-mouse responsiveness, error gate) but each maintains its **own** baseline
-image because the rendering paths differ — native goes naga→MSL via Metal,
-web goes naga→WGSL via the browser, and they produce subtly different
-floats. Don't try to share `tests/baseline.png` and `tests/baseline-native.png`.
+The native and web halves run the same three platform-internal checks
+(pinned baseline, mouse responsiveness, error gate). The cross-platform
+test asserts strict pixel equality between them. After the surface-format
+fix in `lib.rs` and the canvas-chrome suppression in `cross_platform.mjs`,
+the diff is 0/691,200 — both platforms produce byte-identical frames at
+the same locked input.
 
 ### Native (`tests/headless.rs`, `cargo test`)
 
@@ -47,6 +49,29 @@ and returns tightly-packed RGBA8. `tests/headless.rs` uses it for:
 
 `UPDATE_BASELINE=1 cargo test --test headless pinned_baseline` regenerates
 the file. Commit it.
+
+### Cross-platform (`tests/cross_platform.mjs`)
+
+Strict pixel-perfect equality between the native and web frames at the same
+locked input. The native side renders via `cargo run --bin render_frame` and
+the web side captures the canvas via Playwright. Any single pixel differing
+in any channel fails the test.
+
+Two non-obvious things are needed to actually hit zero diff:
+
+1. **Surface format**: Chrome's WebGPU canvas only exposes non-sRGB storage
+   formats (`Bgra8Unorm`, `Rgba8Unorm`, `Rgba16Float`). Without intervention,
+   `surface.get_capabilities().formats[0]` is non-sRGB and the linear shader
+   output gets written raw, while native picks an sRGB format and applies
+   the encoding — diff was 91% before fixing. `lib.rs` now configures the
+   non-sRGB storage with a `view_format` of the sRGB sibling and creates
+   the render-pass view with that format, so the encoding step happens on
+   both platforms regardless of what the canvas exposes.
+2. **Browser-injected canvas chrome**: Chromium paints a 1-pixel focus
+   outline (`rgb(0, 95, 204)` macOS system blue) on the canvas element,
+   which writes into the captured perimeter. The test's `addInitScript`
+   strips `box-shadow`, `outline`, and `border` on `canvas#wgpu` before
+   first paint. Don't touch this without re-running the test.
 
 ### Web (`tests/screenshot.mjs`, Playwright)
 
@@ -112,3 +137,11 @@ without updating both the workflow and `build-web.sh`.
 - The initial size is threaded into `State::new(window, initial_size)`
   directly rather than being read from `window.inner_size()`, for the same
   reason.
+- **Always render through the sRGB view of the surface texture.**
+  `State::new` configures the surface with `view_formats: [sRGB sibling]`
+  and `State::render` builds the color-attachment view with
+  `format: Some(view_format)`. Removing this would silently break
+  cross-platform pixel parity on the web — Chrome's WebGPU canvas exposes
+  only non-sRGB storage formats, so without this fix the linear shader
+  output is written raw on web while native picks an sRGB format and
+  applies the encoding. Pre-fix diff: 91% of pixels differ; post-fix: 0.
