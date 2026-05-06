@@ -49,6 +49,17 @@ Diagnostics on every run:
 Always rebuild with `./build-web.sh` before `npm test`; the test reads the
 last-built `web/dist/` and will fail with exit 2 if the build is missing.
 
+## Deployment
+
+`main` auto-deploys to GitHub Pages via `.github/workflows/pages.yml`.
+Live URL: https://jamecoyne.github.io/primitive/ (publicly viewable even
+though the source repo is private — standard GitHub Pages behavior).
+
+The workflow extracts the wasm-bindgen version from `Cargo.lock` and
+pre-installs the matching CLI via `taiki-e/install-action` so build-web.sh
+skips the slow `cargo install` step. Don't break the awk version-extraction
+without updating both the workflow and `build-web.sh`.
+
 ## Gotchas — do not regress
 
 - **wgpu version is pinned to 24.x.** wgpu 22.x sends the removed WebGPU
