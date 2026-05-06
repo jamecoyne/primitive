@@ -54,43 +54,56 @@ pub trait Node {
     fn record(&self, ctx: &mut NodeContext<'_>);
 }
 
-/// Single fragment-shader node — fullscreen-triangle vertex shader plus
-/// `shaders/mandelbrot.frag`. Reads no input textures.
-pub struct MandelbrotNode {
+/// Generic fragment-shader node. Constructor takes raw GLSL source for both
+/// the vertex and fragment stages so any pair of shaders that follow the
+/// standard layout (no vertex inputs, fragment binds `Uniforms` at
+/// `set=0, binding=0`) can be loaded as a node. Reads no input textures —
+/// the chaining path with input slots is the next slice of work.
+///
+/// `label` is a short identifier (the node id from the TOML config) used
+/// for wgpu debug labels — `<label>:pipeline`, `<label>:pass`, etc.
+pub struct GlslNode {
+    label: String,
     pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
 }
 
-impl MandelbrotNode {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+impl GlslNode {
+    pub fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        vert_src: &str,
+        frag_src: &str,
+        label: &str,
+    ) -> Self {
         // GLSL → naga → backend SPIR-V/MSL/WGSL/GLSL ES.
         let vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mandelbrot.vert"),
+            label: Some(&format!("{label}.vert")),
             source: wgpu::ShaderSource::Glsl {
-                shader: include_str!("../shaders/mandelbrot.vert").into(),
+                shader: vert_src.into(),
                 stage: wgpu::naga::ShaderStage::Vertex,
                 defines: Default::default(),
             },
         });
         let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mandelbrot.frag"),
+            label: Some(&format!("{label}.frag")),
             source: wgpu::ShaderSource::Glsl {
-                shader: include_str!("../shaders/mandelbrot.frag").into(),
+                shader: frag_src.into(),
                 stage: wgpu::naga::ShaderStage::Fragment,
                 defines: Default::default(),
             },
         });
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mandelbrot:uniforms"),
+            label: Some(&format!("{label}:uniforms")),
             size: std::mem::size_of::<Uniforms>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mandelbrot:bind-layout"),
+            label: Some(&format!("{label}:bind-layout")),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::FRAGMENT,
@@ -104,7 +117,7 @@ impl MandelbrotNode {
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mandelbrot:bind-group"),
+            label: Some(&format!("{label}:bind-group")),
             layout: &bind_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -113,13 +126,13 @@ impl MandelbrotNode {
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("mandelbrot:pipeline-layout"),
+            label: Some(&format!("{label}:pipeline-layout")),
             bind_group_layouts: &[&bind_layout],
             push_constant_ranges: &[],
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mandelbrot:pipeline"),
+            label: Some(&format!("{label}:pipeline")),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &vs,
@@ -148,6 +161,7 @@ impl MandelbrotNode {
         });
 
         Self {
+            label: label.to_string(),
             pipeline,
             uniform_buffer,
             bind_group,
@@ -155,7 +169,7 @@ impl MandelbrotNode {
     }
 }
 
-impl Node for MandelbrotNode {
+impl Node for GlslNode {
     fn record(&self, ctx: &mut NodeContext<'_>) {
         let uniforms = Uniforms {
             resolution: [ctx.width as f32, ctx.height as f32],
@@ -166,8 +180,9 @@ impl Node for MandelbrotNode {
         ctx.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
+        let pass_label = format!("{}:pass", self.label);
         let mut pass = ctx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("mandelbrot:pass"),
+            label: Some(&pass_label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: ctx.output,
                 resolve_target: None,
@@ -187,6 +202,25 @@ impl Node for MandelbrotNode {
 }
 
 // ---------------------------------------------------------------------------
+// Compile-time shader registry
+// ---------------------------------------------------------------------------
+
+/// Look up a shader by short name. The wasm bundle can't read the
+/// filesystem so every shader pair must be embedded at compile time via
+/// `include_str!`. Add new entries here as new shaders are added.
+///
+/// Returns `(vert_src, frag_src)`.
+pub fn embedded_shader(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        "mandelbrot" => Some((
+            include_str!("../shaders/mandelbrot.vert"),
+            include_str!("../shaders/mandelbrot.frag"),
+        )),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Config (TOML)
 // ---------------------------------------------------------------------------
 
@@ -200,6 +234,10 @@ pub struct GraphConfig {
 pub struct NodeConfig {
     pub id: String,
     pub kind: String,
+    /// Required when `kind = "glsl"` — the short name of an entry in the
+    /// `embedded_shader` registry (e.g. `"mandelbrot"`).
+    #[serde(default)]
+    pub shader: Option<String>,
     #[serde(default)]
     pub inputs: Vec<String>,
     #[serde(default)]
@@ -223,6 +261,11 @@ pub const DEFAULT_GRAPH_TOML: &str = include_str!("../config/graph.toml");
 pub enum GraphError {
     Config(String),
     UnknownNodeKind { id: String, kind: String },
+    /// `kind = "glsl"` requires a `shader` field naming an `embedded_shader`
+    /// registry entry.
+    MissingShaderField { id: String },
+    /// `shader = "<name>"` didn't match any entry in `embedded_shader`.
+    UnknownShader { id: String, shader: String },
     MissingPresentNode,
     MultiplePresentNodes,
     /// v1 only supports nodes with empty `inputs`. Removed once the chaining
@@ -238,6 +281,15 @@ impl std::fmt::Display for GraphError {
             GraphError::Config(s) => write!(f, "{s}"),
             GraphError::UnknownNodeKind { id, kind } => {
                 write!(f, "node {id:?} has unknown kind {kind:?}")
+            }
+            GraphError::MissingShaderField { id } => {
+                write!(f, "node {id:?} (kind = \"glsl\") is missing the `shader` field")
+            }
+            GraphError::UnknownShader { id, shader } => {
+                write!(
+                    f,
+                    "node {id:?} references shader {shader:?} which is not in the embedded_shader registry"
+                )
             }
             GraphError::MissingPresentNode => write!(f, "no node has `present = true`"),
             GraphError::MultiplePresentNodes => write!(f, "more than one node has `present = true`"),
@@ -307,7 +359,18 @@ impl RenderGraph {
             // intermediate textures, non-present nodes will pick their own.
             let format = present_format;
             let node: Box<dyn Node> = match n.kind.as_str() {
-                "mandelbrot" => Box::new(MandelbrotNode::new(device, format)),
+                "glsl" => {
+                    let shader = n
+                        .shader
+                        .as_deref()
+                        .ok_or_else(|| GraphError::MissingShaderField { id: n.id.clone() })?;
+                    let (vert_src, frag_src) =
+                        embedded_shader(shader).ok_or_else(|| GraphError::UnknownShader {
+                            id: n.id.clone(),
+                            shader: shader.to_string(),
+                        })?;
+                    Box::new(GlslNode::new(device, format, vert_src, frag_src, &n.id))
+                }
                 other => {
                     return Err(GraphError::UnknownNodeKind {
                         id: n.id.clone(),
