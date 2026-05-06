@@ -3,6 +3,10 @@ name = "wgpuweb"
 version = "0.1.0"
 edition = "2021"
 publish = false
+# Two bins exist (`wgpuweb` from src/main.rs, `render_frame` from src/bin/),
+# so cargo can't pick one without help. The render_frame bin is a test
+# helper; the live app is wgpuweb.
+default-run = "wgpuweb"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
