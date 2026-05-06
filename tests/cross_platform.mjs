@@ -5,13 +5,9 @@
 //   - browser, via Playwright + WebGPU (wgpu → naga → WGSL → browser → MSL)
 // then strict-compares pixels. Fails if any channel of any pixel differs.
 //
-// Why we expect this to fail today: the two paths produce subtly different
-// floats — both go through naga as the IR but the *output* shader language
-// differs (MSL native vs WGSL handed to the browser), and the browser's
-// canvas → screenshot pipeline applies its own composite. The test exists
-// to (a) quantify the divergence so we know if it grows, and (b) be the
-// first place to find out if a future change makes the platforms agree
-// pixel-perfect.
+// The web canvas now follows the viewport size, so we render web first to
+// learn its actual dimensions, then run the native renderer at the same
+// dimensions before comparing.
 
 import { chromium } from 'playwright';
 import { PNG } from 'pngjs';
@@ -26,7 +22,10 @@ const ROOT = resolve(fileURLToPath(import.meta.url), '../..');
 const DIST = join(ROOT, 'web/dist');
 const OUT  = join(ROOT, 'tests/output');
 
-const W = 960, H = 720;
+// Viewport size — canvas fills 100vw × 100vh in CSS, so canvas dimensions
+// (and therefore the native bin's render size) follow this.
+const VIEWPORT_W = 1024;
+const VIEWPORT_H = 800;
 const TIME = 2.5;
 const MX = 0.5;
 const MY = 0.5;
@@ -71,15 +70,15 @@ async function ensureBuilt() {
     }
 }
 
-function renderNative(outputPath) {
+function renderNative(outputPath, width, height) {
     const r = spawnSync('cargo', [
         'run', '--bin', 'render_frame', '--quiet', '--',
         '--output', outputPath,
         '--time', String(TIME),
         '--mx', String(MX),
         '--my', String(MY),
-        '--width', String(W),
-        '--height', String(H),
+        '--width', String(width),
+        '--height', String(height),
     ], { stdio: ['ignore', 'inherit', 'inherit'], cwd: ROOT });
     if (r.status !== 0) {
         console.error('cargo run --bin render_frame failed');
@@ -87,6 +86,7 @@ function renderNative(outputPath) {
     }
 }
 
+// Returns { width, height } of the canvas as it actually rendered.
 async function renderWeb(outputPath) {
     const { server, url } = await startServer();
     const browser = await chromium.launch({
@@ -96,36 +96,13 @@ async function renderWeb(outputPath) {
             '--use-angle=metal',
             '--ignore-gpu-blocklist',
             '--enable-gpu-rasterization',
-            // Force sRGB color profile for screenshots so the captured bytes
-            // match what the GPU wrote — without this Chromium may convert
-            // through the display profile, shifting magenta channel values
-            // by ~32/255 vs the native readback.
             '--force-color-profile=srgb',
             '--disable-features=ColorCorrectRendering',
         ],
     });
     const context = await browser.newContext({
-        viewport: { width: 1024, height: 800 },
+        viewport: { width: VIEWPORT_W, height: VIEWPORT_H },
         deviceScaleFactor: 1,
-    });
-    // Strip browser-injected canvas chrome before paint:
-    //  - box-shadow: orange outer shadow that anti-aliases into edge pixels.
-    //  - outline:    Chromium paints a 1px focus outline on the canvas
-    //                (rgb(0,95,204), macOS system blue) which writes into
-    //                the captured perimeter and would account for ~3.4k of
-    //                edge-only diffs otherwise.
-    await context.addInitScript(() => {
-        const apply = () => {
-            const style = document.createElement('style');
-            style.textContent =
-                'canvas#wgpu { box-shadow: none !important; outline: none !important; border: none !important; }';
-            document.head.appendChild(style);
-        };
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', apply, { once: true });
-        } else {
-            apply();
-        }
     });
     const page = await context.newPage();
 
@@ -136,9 +113,17 @@ async function renderWeb(outputPath) {
     await page.goto(`${url}?t=${TIME}&mx=${MX}&my=${MY}`, { waitUntil: 'networkidle' });
     await page.waitForTimeout(2500);
 
-    // Element-scoped screenshot: Playwright captures only the canvas element's
-    // own layer, avoiding the page-compositor edge anti-aliasing that a
-    // page-level screenshot+clip would mix in.
+    const dims = await page.evaluate(() => {
+        const c = document.querySelector('canvas');
+        return c ? { width: c.width, height: c.height } : null;
+    });
+    if (!dims || dims.width <= 0 || dims.height <= 0) {
+        console.error(`unexpected canvas size: ${JSON.stringify(dims)}`);
+        process.exit(2);
+    }
+
+    // Element-scoped screenshot — captures only the canvas's own layer,
+    // bypassing page-compositor edge anti-aliasing.
     await page.locator('canvas#wgpu').screenshot({ path: outputPath });
 
     await browser.close();
@@ -149,6 +134,7 @@ async function renderWeb(outputPath) {
         errors.forEach(e => console.error('  ' + e));
         process.exit(2);
     }
+    return dims;
 }
 
 function diff(nativePng, webPng) {
@@ -187,11 +173,12 @@ async function main() {
     const nativePath = join(OUT, 'native-frame.png');
     const webPath    = join(OUT, 'web-frame.png');
 
-    console.log('rendering native via cargo run --bin render_frame...');
-    renderNative(nativePath);
-
     console.log('rendering web via headless Chromium...');
-    await renderWeb(webPath);
+    const { width, height } = await renderWeb(webPath);
+    console.log(`web canvas: ${width}×${height}`);
+
+    console.log(`rendering native via cargo run --bin render_frame at ${width}×${height}...`);
+    renderNative(nativePath, width, height);
 
     const nativeBuf = await readFile(nativePath);
     const webBuf    = await readFile(webPath);

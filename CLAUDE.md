@@ -126,17 +126,27 @@ without updating both the workflow and `build-web.sh`.
   at `requestDevice` with `OperationError`. Don't downgrade. wgpu ≥25 has a
   larger API delta (many breaking changes); upgrading is fine but expect
   several call-site updates.
-- **The web canvas must already exist in the DOM at a known size before
-  winit binds to it.** `index.html` has `<canvas id="wgpu" width="960"
-  height="720">` and `lib.rs` looks it up via `get_element_by_id` and
-  `WindowAttributesExtWebSys::with_canvas`. Don't replace this with
-  `with_append(true)` — `winit::Window::inner_size()` on web races browser
-  layout and returns 0×0 immediately after window creation, which produced a
-  1×1 surface that was CSS-scaled up to look correctly sized but rendered a
-  single fragment-shader sample.
+- **The web canvas must have its drawing-buffer size set in JS before
+  the wasm reads it.** `index.html` has `<canvas id="wgpu">` (no width/height
+  attributes — the canvas fills the viewport via CSS) and the inline
+  `<script>` does `c.width = window.innerWidth; c.height = window.innerHeight;`
+  before `await init()`. `lib.rs` then reads those via `get_element_by_id`
+  and passes them through `WindowAttributesExtWebSys::with_canvas` +
+  `with_inner_size`. Don't drop the JS sizing — `winit::Window::inner_size()`
+  on web races browser layout and returns 0×0 immediately after window
+  creation, which previously produced a 1×1 surface that CSS scaled up to
+  look correct but rendered exactly one fragment-shader sample. winit's
+  ResizeObserver picks up subsequent CSS-size changes and emits `Resized`
+  events.
 - The initial size is threaded into `State::new(window, initial_size)`
   directly rather than being read from `window.inner_size()`, for the same
   reason.
+- **`State::resize` must refresh the locked-mouse position.** When the
+  cursor is pinned via the test lock (`?mx=&my=`) and the canvas resizes
+  (which happens at least once on web — winit's ResizeObserver fires after
+  the initial layout settles), the stored pixel position becomes stale.
+  `resize()` recomputes from `lock.mouse_uv` so locked-frame screenshots
+  stay deterministic.
 - **Always render through the sRGB view of the surface texture.**
   `State::new` configures the surface with `view_formats: [sRGB sibling]`
   and `State::render` builds the color-attachment view with
