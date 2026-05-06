@@ -3,18 +3,20 @@
 #
 # Schema (per [[node]] entry):
 #   id        : unique string identifier
-#   kind      : node type — currently only "mandelbrot" is implemented
-#   inputs    : array of upstream node ids whose outputs feed this node
+#   kind      : node type — currently only "glsl" is implemented
+#   shader    : (kind = "glsl") name of an entry in src/render_graph.rs's
+#               `embedded_shader` registry. Add a new shader by registering
+#               its `include_str!`-ed sources there.
+#   inputs    : array of upstream node ids whose outputs feed this node.
+#               Must be empty until the chaining/intermediate-texture path
+#               lands; the graph builder rejects non-empty `inputs` today.
 #   present   : if true, this node renders to the swapchain (surface) view
 #               instead of an intermediate texture; exactly one node must
-#               have `present = true`
-#
-# v1 only supports a single mandelbrot node with no inputs. Adding a
-# second node type (e.g. a post-process pass) will exercise the inputs/
-# chaining path of the graph.
+#               have `present = true`.
 
 [[node]]
 id = "mandelbrot"
-kind = "mandelbrot"
+kind = "glsl"
+shader = "mandelbrot"
 inputs = []
 present = true
