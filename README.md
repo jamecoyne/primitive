@@ -1,5 +1,8 @@
 # wgpuweb
 
+[![Test](https://github.com/jamecoyne/primitive/actions/workflows/test.yml/badge.svg)](https://github.com/jamecoyne/primitive/actions/workflows/test.yml)
+[![Deploy to GitHub Pages](https://github.com/jamecoyne/primitive/actions/workflows/pages.yml/badge.svg)](https://github.com/jamecoyne/primitive/actions/workflows/pages.yml)
+
 Proof-of-concept Rust + [wgpu](https://wgpu.rs) app that renders the Mandelbrot
 set with a GLSL fragment shader and runs from the same source on **native
 macOS** and **the browser** (compiled to WebAssembly via `wasm-bindgen`). The
