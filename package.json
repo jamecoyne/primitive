@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "dev:web": "node tools/dev-serve.mjs",
     "test": "npm run test:native && npm run test:web && npm run test:cross",
     "test:native": "cargo test --test headless",
     "test:web": "./build-web.sh && node tests/screenshot.mjs",

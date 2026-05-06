@@ -34,6 +34,17 @@ cargo run --release
 
 ### Web (WebGPU, with WebGL2 fallback)
 
+One-liner — builds, serves, opens a browser tab:
+
+```sh
+npm run dev:web
+```
+
+Set `PORT=8001` (or any value) to override the default `8000`; the script
+falls through to the next free port if the requested one is in use.
+
+Manual flow when you'd rather not have a browser tab pop:
+
 ```sh
 ./build-web.sh
 cd web/dist && python3 -m http.server 8000
