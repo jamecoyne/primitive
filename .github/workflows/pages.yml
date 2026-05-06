@@ -1,0 +1,63 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Avoid concurrent deploys clobbering each other.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Pre-install wasm-bindgen-cli at the version pinned in Cargo.lock so
+      # build-web.sh's version-check skips the slow `cargo install` step.
+      # taiki-e/install-action grabs precompiled binaries (~seconds, vs
+      # minutes for cargo install).
+      - name: Resolve wasm-bindgen version from Cargo.lock
+        id: wbg
+        run: |
+          v=$(awk '
+            /^\[\[package\]\]/ { in_pkg=1; name=""; next }
+            in_pkg && /^name = "wasm-bindgen"$/ { name="wasm-bindgen"; next }
+            in_pkg && /^version = / && name=="wasm-bindgen" { gsub(/version = |"/,""); print; exit }
+          ' Cargo.lock)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "wasm-bindgen pinned at $v"
+
+      - name: Install wasm-bindgen-cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@${{ steps.wbg.outputs.version }}
+
+      - name: Build web bundle
+        run: ./build-web.sh
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
