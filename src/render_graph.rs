@@ -718,6 +718,15 @@ pub struct ViewerSlot<'a> {
     pub height: u32,
 }
 
+/// Counters returned by `RenderGraph::render` so the caller (HUD, perf
+/// logging) can show what the graph just did.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct FrameStats {
+    /// Total number of `begin_render_pass` calls the graph submitted —
+    /// schedule walk + viewer downsamples + present blit + PiP overlays.
+    pub passes: u32,
+}
+
 struct Intermediate {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -974,8 +983,9 @@ impl RenderGraph {
     /// Walk the schedule (every node renders into its own intermediate),
     /// downsample any viewer-enabled nodes into their viewer textures,
     /// then run the present blit to copy the present node's intermediate
-    /// into `ctx.output`.
-    pub fn render(&self, ctx: &mut NodeContext<'_>) {
+    /// into `ctx.output`. Returns counters describing the work submitted.
+    pub fn render(&self, ctx: &mut NodeContext<'_>) -> FrameStats {
+        let mut passes: u32 = 0;
         for &node_idx in &self.schedule {
             let output = &self.intermediates[node_idx]
                 .as_ref()
@@ -991,6 +1001,7 @@ impl RenderGraph {
                 mouse: ctx.mouse,
             };
             self.nodes[node_idx].impl_.record(&mut sub_ctx);
+            passes += 1;
         }
 
         // Viewer downsamples — independent of present, can run in any
@@ -1001,6 +1012,7 @@ impl RenderGraph {
                 let label = format!("{}:viewer:downsample-pass", self.nodes[i].id);
                 self.viewer_blit
                     .record(ctx.encoder, &v.downsample_bg, &v.view, &label);
+                passes += 1;
             }
         }
 
@@ -1010,6 +1022,7 @@ impl RenderGraph {
             .expect("present_bind_group not set — graph.resize must run before render");
         self.present_blit
             .record(ctx.encoder, present_bg, ctx.output, "present-blit:pass");
+        passes += 1;
 
         // PiP overlays — draw each viewer thumbnail at its configured
         // corner. Multiple viewers in the same corner stack: top corners
@@ -1031,7 +1044,10 @@ impl RenderGraph {
                 [x as f32, y as f32, v.width as f32, v.height as f32],
                 &label,
             );
+            passes += 1;
         }
+
+        FrameStats { passes }
     }
 
     /// Sum of bytes the graph currently has allocated in intermediate

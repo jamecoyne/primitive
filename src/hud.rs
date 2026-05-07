@@ -9,9 +9,9 @@
 use font8x8::legacy::BASIC_LEGACY;
 
 /// HUD bitmap dimensions. 8×8 font with no inter-character spacing fits
-/// roughly 32 chars across; 4 lines plus a few pixels of padding.
+/// roughly 32 chars across; 6 lines plus a few pixels of padding.
 const HUD_WIDTH: u32 = 280;
-const HUD_HEIGHT: u32 = 56;
+const HUD_HEIGHT: u32 = 72;
 
 /// Translucent black background pixel, premultiplied for the alpha blend.
 const BG_RGBA: [u8; 4] = [0, 0, 0, 180];

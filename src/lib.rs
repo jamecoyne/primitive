@@ -39,15 +39,21 @@ struct State {
     start: web_time::Instant,
     mouse: [f32; 2],
     lock: TestLock,
-    // HUD overlay — adapter info, allocated bytes, rolling FPS. Hidden
-    // when `lock` has any field set so the headless screenshot harness
-    // can still produce byte-identical frames.
+    // HUD overlay — adapter info, allocated bytes, pass count, rolling
+    // FPS, and rolling CPU time per render() call. Hidden when `lock`
+    // has any field set so the headless screenshot harness can still
+    // produce byte-identical frames.
     hud: Hud,
     adapter_info: wgpu::AdapterInfo,
     last_frame: Option<web_time::Instant>,
-    /// Ring of recent frame times in seconds (most recent at the back).
+    /// Ring of recent frame intervals in seconds (most recent at the back).
     /// Capped at FRAME_WINDOW; FPS is N / sum(window).
     frame_times: std::collections::VecDeque<f32>,
+    /// Ring of recent render() durations in seconds. Same window as above.
+    cpu_times: std::collections::VecDeque<f32>,
+    /// Pass count from the most recent `graph.render` call. Updated each
+    /// frame; not smoothed because it's deterministic from the config.
+    last_pass_count: u32,
 }
 
 const FRAME_WINDOW: usize = 60;
@@ -172,6 +178,8 @@ impl State {
             adapter_info,
             last_frame: None,
             frame_times: std::collections::VecDeque::with_capacity(FRAME_WINDOW),
+            cpu_times: std::collections::VecDeque::with_capacity(FRAME_WINDOW),
+            last_pass_count: 0,
         }
     }
 
@@ -209,6 +217,7 @@ impl State {
             }
         }
         self.last_frame = Some(now);
+        let render_start = now;
 
         let frame = self.surface.get_current_texture()?;
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
@@ -235,7 +244,8 @@ impl State {
             time,
             mouse: self.mouse,
         };
-        self.graph.render(&mut ctx);
+        let stats = self.graph.render(&mut ctx);
+        self.last_pass_count = stats.passes;
 
         // HUD overlay — render on top of the graph output. Hidden when a
         // test lock is set so the screenshot harness gets byte-identical
@@ -248,12 +258,23 @@ impl State {
                 let sum: f32 = self.frame_times.iter().sum();
                 self.frame_times.len() as f32 / sum
             };
+            let cpu_ms = if self.cpu_times.is_empty() {
+                0.0
+            } else {
+                let sum: f32 = self.cpu_times.iter().sum();
+                sum / self.cpu_times.len() as f32 * 1000.0
+            };
+            // The HUD pass adds one more render pass to whatever the
+            // graph reported, so include it in the displayed total.
+            let total_passes = self.last_pass_count + 1;
             let mem_mib = self.graph.allocated_bytes() as f32 / (1024.0 * 1024.0);
             let text = format!(
-                "GPU:     {}\nBackend: {}\nMem:     {:.2} MiB\nFPS:     {:.1}",
+                "GPU:     {}\nBackend: {}\nMem:     {:.2} MiB\nPasses:  {}\nCPU:     {:.2} ms\nFPS:     {:.1}",
                 gpu_label(&self.adapter_info),
                 backend_label(self.adapter_info.backend),
                 mem_mib,
+                total_passes,
+                cpu_ms,
                 fps,
             );
             self.hud.set_text(&self.queue, &text);
@@ -277,6 +298,17 @@ impl State {
 
         self.queue.submit(Some(encoder.finish()));
         frame.present();
+
+        // Capture CPU work duration after submit. Smoothed across the same
+        // 60-frame window as fps; fed back into the HUD on the *next* frame
+        // (so the displayed value is from the previous render's work).
+        let cpu_dt = render_start.elapsed().as_secs_f32();
+        if cpu_dt > 0.0 && cpu_dt < 1.0 {
+            if self.cpu_times.len() == FRAME_WINDOW {
+                self.cpu_times.pop_front();
+            }
+            self.cpu_times.push_back(cpu_dt);
+        }
         Ok(())
     }
 }
