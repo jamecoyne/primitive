@@ -35,7 +35,7 @@
 #                 viewer = { enabled = true, resolution = [256, 192], position = [400, 16] }
 
 [out]
-input = "invert"
+input = "out"
 
 # 1) Mandelbrot — generates the fractal into an intermediate texture.
 #    Viewer enabled so a preview UI can sample the un-inverted output.
@@ -169,3 +169,13 @@ void main() {
     o_color = vec4(1.0 - c.rgb, c.a);
 }
 '''
+
+# 3) Out — passthrough sink that the swapchain reads from. Lives in the
+#    network like any other node so its viewer thumbnail shows the final
+#    output of the graph. Wired to `invert` by default; reroute by
+#    drag-connecting a different node's output to its input port.
+[[node]]
+id = "out"
+kind = "out"
+inputs = ["invert"]
+viewer = { enabled = true, resolution = [256, 192], position = [624, 16] }

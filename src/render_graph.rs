@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use bytemuck::{Pod, Zeroable};
+use font8x8::legacy::BASIC_LEGACY;
 use serde::Deserialize;
 
 /// Per-frame globals shared by every fragment-shader node.
@@ -405,6 +406,43 @@ pub const DEFAULT_GRAPH_TOML: &str = include_str!("../config/graph.toml");
 /// boundary: sampling the intermediate decodes back to linear, writing
 /// to the swapchain re-encodes — round-trip is exact at 8-bit precision.
 const INTERMEDIATE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+/// Passthrough vertex + fragment shaders used by `kind = "out"` nodes.
+/// Same fullscreen-triangle vertex as every GlslNode; fragment samples
+/// the single input and writes it unchanged. Bind layout matches
+/// GlslNode's input_count=1 expectation (set=0/binding=0 uniforms,
+/// binding=1 sampler, binding=2 input texture).
+const OUT_NODE_VERT: &str = "#version 450
+layout(location = 0) out vec2 v_uv;
+void main() {
+    vec2 pos = vec2(
+        float((gl_VertexIndex & 1) * 4) - 1.0,
+        float((gl_VertexIndex & 2) * 2) - 1.0
+    );
+    v_uv = pos * 0.5 + 0.5;
+    gl_Position = vec4(pos, 0.0, 1.0);
+}
+";
+const OUT_NODE_FRAG: &str = "#version 450
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 o_color;
+layout(set = 0, binding = 0) uniform Uniforms {
+    vec2 resolution;
+    vec2 mouse;
+    float time;
+    float _pad0;
+    float _pad1;
+    float _pad2;
+} u;
+layout(set = 0, binding = 1) uniform sampler   s_in;
+layout(set = 0, binding = 2) uniform texture2D t_input0;
+void main() {
+    // Same y-flip every other input-consumer node uses — keeps the
+    // upstream image upright when sampled.
+    vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+    o_color = texture(sampler2D(t_input0, s_in), uv);
+}
+";
 
 // ---------------------------------------------------------------------------
 // Blitter — generic fullscreen-quad sample → write pipeline. Used twice by
@@ -869,6 +907,557 @@ impl EyeOverlay {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Label — small textured-quad subsystem for the per-node "id (kind)"
+// strip drawn beneath each viewer thumbnail. Mirrors the HUD's pattern
+// (font8x8 raster → RGBA8 texture → alpha-blended quad) but builds one
+// texture per node so all labels can be rendered with their own bind
+// group. Pipeline + sampler + bind layout are shared via LabelPipeline.
+// ---------------------------------------------------------------------------
+
+/// On-screen char height before zoom is applied, in physical pixels.
+/// `font8x8` glyphs are 8 px tall natively; we upscale by integer
+/// nearest-neighbor sampling so the texture stays small.
+const LABEL_CHAR_PX: u32 = 12;
+/// Padding around the text inside the label bitmap.
+const LABEL_PAD_PX: u32 = 6;
+/// Pixel gap between a thumbnail's bottom edge and the top of its label.
+const LABEL_GAP_PX: u32 = 8;
+
+const LABEL_VERT: &str = "#version 450
+layout(location = 0) out vec2 v_uv;
+void main() {
+    vec2 pos = vec2(
+        float((gl_VertexIndex & 1) * 4) - 1.0,
+        float((gl_VertexIndex & 2) * 2) - 1.0
+    );
+    v_uv = pos * 0.5 + 0.5;
+    gl_Position = vec4(pos, 0.0, 1.0);
+}
+";
+
+const LABEL_FRAG: &str = "#version 450
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 o_color;
+layout(set = 0, binding = 0) uniform sampler   s_in;
+layout(set = 0, binding = 1) uniform texture2D t_in;
+void main() {
+    // Texture y=0 is top of the bitmap; v_uv y=0 is the bottom of the
+    // viewport. Flip y so glyphs read upright.
+    vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+    o_color = texture(sampler2D(t_in, s_in), uv);
+}
+";
+
+struct LabelPipeline {
+    pipeline: wgpu::RenderPipeline,
+    bind_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+impl LabelPipeline {
+    fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        let vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("label.vert"),
+            source: wgpu::ShaderSource::Glsl {
+                shader: LABEL_VERT.into(),
+                stage: wgpu::naga::ShaderStage::Vertex,
+                defines: Default::default(),
+            },
+        });
+        let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("label.frag"),
+            source: wgpu::ShaderSource::Glsl {
+                shader: LABEL_FRAG.into(),
+                stage: wgpu::naga::ShaderStage::Fragment,
+                defines: Default::default(),
+            },
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("label:sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("label:bind-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("label:pipeline-layout"),
+            bind_group_layouts: &[&bind_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("label:pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &vs,
+                entry_point: Some("main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fs,
+                entry_point: Some("main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        Self {
+            pipeline,
+            bind_layout,
+            sampler,
+        }
+    }
+
+    fn record(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        viewport: [f32; 4],
+        bind_group: &wgpu::BindGroup,
+        label: &str,
+        ts_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: ts_writes,
+        });
+        pass.set_viewport(viewport[0], viewport[1], viewport[2], viewport[3], 0.0, 1.0);
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+struct Label {
+    bind_group: wgpu::BindGroup,
+    /// Native bitmap dimensions before zoom. Render path scales by
+    /// `network_zoom` when computing the on-screen viewport.
+    width: u32,
+    height: u32,
+    /// Texture is kept alive so the bind group's view remains valid.
+    #[allow(dead_code)]
+    texture: wgpu::Texture,
+}
+
+impl Label {
+    /// Rasterize `text` into a tight RGBA8 bitmap (translucent dark
+    /// background, white glyphs) and upload to a fresh texture.
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline: &LabelPipeline,
+        text: &str,
+        debug_label: &str,
+    ) -> Self {
+        // Each char is LABEL_CHAR_PX wide × LABEL_CHAR_PX tall after the
+        // 8 → LABEL_CHAR_PX integer upscale. We pad both axes.
+        let scale = LABEL_CHAR_PX / 8;
+        let width = LABEL_PAD_PX * 2 + (text.chars().count() as u32) * LABEL_CHAR_PX;
+        let height = LABEL_PAD_PX * 2 + LABEL_CHAR_PX;
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        // Translucent dark background, premultiplied for the alpha blend.
+        let bg: [u8; 4] = [10, 11, 14, 200];
+        for chunk in pixels.chunks_exact_mut(4) {
+            chunk[0] = (bg[0] as u16 * bg[3] as u16 / 255) as u8;
+            chunk[1] = (bg[1] as u16 * bg[3] as u16 / 255) as u8;
+            chunk[2] = (bg[2] as u16 * bg[3] as u16 / 255) as u8;
+            chunk[3] = bg[3];
+        }
+        // White glyphs, fully opaque. Premultiplied = same as straight
+        // since alpha is 1.
+        for (i, ch) in text.chars().enumerate() {
+            let glyph = if (ch as usize) < BASIC_LEGACY.len() {
+                BASIC_LEGACY[ch as usize]
+            } else {
+                BASIC_LEGACY[b' ' as usize]
+            };
+            let cx0 = LABEL_PAD_PX + i as u32 * LABEL_CHAR_PX;
+            let cy0 = LABEL_PAD_PX;
+            for row in 0..8u32 {
+                let bits = glyph[row as usize];
+                for col in 0..8u32 {
+                    if bits & (1 << col) == 0 {
+                        continue;
+                    }
+                    for sx in 0..scale {
+                        for sy in 0..scale {
+                            let px = cx0 + col * scale + sx;
+                            let py = cy0 + row * scale + sy;
+                            if px < width && py < height {
+                                let idx = ((py * width + px) * 4) as usize;
+                                pixels[idx] = 255;
+                                pixels[idx + 1] = 255;
+                                pixels[idx + 2] = 255;
+                                pixels[idx + 3] = 255;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&format!("label:{debug_label}:texture")),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!("label:{debug_label}:bind-group")),
+            layout: &pipeline.bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Sampler(&pipeline.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+            ],
+        });
+
+        Self {
+            bind_group,
+            width,
+            height,
+            texture,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GraphOverlay — draws every node's input/output ports as small filled
+// circles and connections between them as line segments. Single
+// alpha-blended pass over the whole canvas; per-frame uniform writes
+// the port + edge lists. SDFs in the fragment shader produce
+// near-pixel-perfect anti-aliased edges. Drawn last so it sits on top
+// of every thumbnail (border, content, eye icon).
+// ---------------------------------------------------------------------------
+
+const MAX_GRAPH_PORTS: usize = 16;
+const MAX_GRAPH_EDGES: usize = 16;
+/// Pixel radius of a port circle on screen. Mirrored in the fragment
+/// shader (`PORT_R`) — must stay in sync.
+const PORT_RADIUS_PX: f32 = 9.0;
+/// Pixel offset of each port's centre from the thumbnail edge it sits
+/// on. With PORT_RADIUS_PX = 9, the inner edge of the circle just
+/// kisses the thumbnail border (offset = radius).
+const PORT_OFFSET_PX: f32 = PORT_RADIUS_PX;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GraphOverlayUniforms {
+    /// Canvas size in physical pixels.
+    canvas: [f32; 2],
+    port_count: u32,
+    edge_count: u32,
+    /// Each entry: `[x, y, _, _]` — port centre in pixel coordinates with
+    /// y=0 at the top of the canvas. Padded to vec4 for std140.
+    ports: [[f32; 4]; MAX_GRAPH_PORTS],
+    /// Each entry: `[ax, ay, bx, by]` — line segment endpoints.
+    edges: [[f32; 4]; MAX_GRAPH_EDGES],
+}
+
+const GRAPH_OVERLAY_VERT: &str = "#version 450
+layout(location = 0) out vec2 v_uv;
+void main() {
+    vec2 pos = vec2(
+        float((gl_VertexIndex & 1) * 4) - 1.0,
+        float((gl_VertexIndex & 2) * 2) - 1.0
+    );
+    v_uv = pos * 0.5 + 0.5;
+    gl_Position = vec4(pos, 0.0, 1.0);
+}
+";
+
+// Note: the array sizes here must match MAX_GRAPH_PORTS / MAX_GRAPH_EDGES.
+// Port encoding: ports[i].xy = pixel center, ports[i].z = kind
+// (0.0 = input, 1.0 = output). The shader uses kind to tint the fill.
+const GRAPH_OVERLAY_FRAG: &str = "#version 450
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 o_color;
+
+layout(set = 0, binding = 0) uniform GraphOverlay {
+    vec2 canvas;
+    uint port_count;
+    uint edge_count;
+    vec4 ports[16];
+    vec4 edges[16];
+} u;
+
+#define PORT_R    9.0
+#define PORT_RING 2.0
+
+float sd_circle(vec2 p, float r) {
+    return length(p) - r;
+}
+
+float sd_segment(vec2 p, vec2 a, vec2 b) {
+    vec2 pa = p - a;
+    vec2 ba = b - a;
+    float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return length(pa - ba * h);
+}
+
+void main() {
+    // Map v_uv (0..1, y=0 at bottom) → pixel-space with y=0 at top.
+    vec2 px = vec2(v_uv.x, 1.0 - v_uv.y) * u.canvas;
+
+    // Edges (orange wires).
+    float edge_d = 1e6;
+    for (int i = 0; i < 16; ++i) {
+        if (uint(i) >= u.edge_count) break;
+        vec2 a = u.edges[i].xy;
+        vec2 b = u.edges[i].zw;
+        edge_d = min(edge_d, sd_segment(px, a, b) - 1.8);
+    }
+
+    // Ports — find the closest port and remember its kind.
+    float port_d = 1e6;
+    float port_kind = 0.0;
+    for (int i = 0; i < 16; ++i) {
+        if (uint(i) >= u.port_count) break;
+        vec2 c = u.ports[i].xy;
+        float d = sd_circle(px - c, PORT_R);
+        if (d < port_d) {
+            port_d = d;
+            port_kind = u.ports[i].z;
+        }
+    }
+
+    // Compose: wires beneath, port ring + fill on top. Inputs sky-blue,
+    // outputs warm orange — easy to tell which end is which at a glance.
+    vec4 col = vec4(0.0);
+
+    if (edge_d < 1.5) {
+        float a = clamp(1.0 - edge_d / 1.5, 0.0, 1.0);
+        col = vec4(1.0, 0.65, 0.15, a);
+    }
+
+    if (port_d <= PORT_RING) {
+        // Inside the port disc — outline ring or filled core.
+        vec3 fill = mix(vec3(0.30, 0.65, 1.00),  // input
+                        vec3(1.00, 0.65, 0.15),  // output
+                        port_kind);
+        // Ring is the outermost ~PORT_RING px of the disc, pure dark.
+        bool in_ring = port_d > -PORT_RING;
+        vec3 ring = vec3(0.05, 0.05, 0.06);
+        vec3 c = in_ring ? ring : fill;
+        // AA at the very outer edge.
+        float a = clamp(1.0 - port_d / 1.5, 0.0, 1.0);
+        col = vec4(c, a);
+    }
+
+    o_color = col;
+}
+";
+
+struct GraphOverlay {
+    pipeline: wgpu::RenderPipeline,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl GraphOverlay {
+    fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat, label: &str) -> Self {
+        let vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(&format!("{label}.vert")),
+            source: wgpu::ShaderSource::Glsl {
+                shader: GRAPH_OVERLAY_VERT.into(),
+                stage: wgpu::naga::ShaderStage::Vertex,
+                defines: Default::default(),
+            },
+        });
+        let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(&format!("{label}.frag")),
+            source: wgpu::ShaderSource::Glsl {
+                shader: GRAPH_OVERLAY_FRAG.into(),
+                stage: wgpu::naga::ShaderStage::Fragment,
+                defines: Default::default(),
+            },
+        });
+
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("{label}:uniforms")),
+            size: std::mem::size_of::<GraphOverlayUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(&format!("{label}:bind-layout")),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!("{label}:bind-group")),
+            layout: &bind_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("{label}:pipeline-layout")),
+            bind_group_layouts: &[&bind_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&format!("{label}:pipeline")),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &vs,
+                entry_point: Some("main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fs,
+                entry_point: Some("main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        Self {
+            pipeline,
+            uniform_buffer,
+            bind_group,
+        }
+    }
+
+    fn upload(&self, queue: &wgpu::Queue, uniforms: &GraphOverlayUniforms) {
+        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(uniforms));
+    }
+
+    fn record(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        canvas_w: u32,
+        canvas_h: u32,
+        label: &str,
+        ts_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: ts_writes,
+        });
+        pass.set_viewport(0.0, 0.0, canvas_w as f32, canvas_h as f32, 0.0, 1.0);
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
 #[derive(Debug)]
 pub enum GraphError {
     Config(String),
@@ -883,6 +1472,8 @@ pub enum GraphError {
     UnknownInput { node: String, input: String },
     /// The graph contains a cycle that includes the named node.
     CycleInvolving { node: String },
+    /// `kind = "out"` requires exactly one input.
+    OutNodeArity { id: String, got: usize },
 }
 
 impl std::fmt::Display for GraphError {
@@ -910,6 +1501,9 @@ impl std::fmt::Display for GraphError {
             GraphError::CycleInvolving { node } => {
                 write!(f, "cycle detected: node {node:?} is part of a cycle")
             }
+            GraphError::OutNodeArity { id, got } => {
+                write!(f, "node {id:?} (kind = \"out\") needs exactly 1 input, got {got}")
+            }
         }
     }
 }
@@ -919,7 +1513,12 @@ impl std::error::Error for GraphError {}
 struct NodeEntry {
     id: String,
     /// Upstream node indices in the order declared in `NodeConfig::inputs`.
-    inputs: Vec<usize>,
+    /// Slot count is fixed at build time (matches the GLSL bind layout),
+    /// but each slot is mutable: `None` means disconnected, in which case
+    /// `set_inputs` feeds a stub black texture for that slot. Drag-to-
+    /// connect / drag-to-disconnect mutate this through `connect_input`
+    /// and `disconnect_input`.
+    inputs: Vec<Option<usize>>,
     impl_: Box<dyn Node>,
     /// Rolling buffer of CPU dispatch times (record() durations) in
     /// seconds. Note: this is encoder build-up CPU time, NOT real GPU
@@ -966,6 +1565,19 @@ pub struct RenderGraph {
     /// Procedural eye icon overlaid on the top-left of each thumbnail.
     /// Click hit-testing in this rect toggles the per-node preview.
     eye_overlay: EyeOverlay,
+    /// Shared pipeline + sampler + bind layout for per-node text labels.
+    /// One of these is shared by every Label entry below.
+    label_pipeline: LabelPipeline,
+    /// One label per node — `None` for nodes whose viewer is disabled
+    /// (no thumbnail to anchor the label under).
+    labels: Vec<Option<Label>>,
+    /// Pre-built timestamp labels for the per-node label passes.
+    viewer_label_labels: Vec<String>,
+    /// Overlay that draws ports + connection lines for every viewer-
+    /// enabled node. Single uniform-driven pass over the whole canvas.
+    graph_overlay: GraphOverlay,
+    /// Pre-built timestamp label for the graph overlay pass.
+    graph_overlay_label: String,
     /// Per-node runtime flag: `true` (default) renders the live
     /// downsampled thumbnail, `false` renders the gray placeholder.
     /// Toggled by `toggle_viewer_preview` from a click on the eye icon.
@@ -985,6 +1597,22 @@ pub struct RenderGraph {
     viewer_eye_labels: Vec<String>,
     width: u32,
     height: u32,
+    /// Network-viewer affine: every viewer's screen rect is computed as
+    /// `world * zoom + pan`. Driven by mouse-wheel zoom (cursor-anchored)
+    /// so wheeling on a thumbnail makes that thumbnail's pixels grow
+    /// outward without drifting away from the cursor.
+    network_zoom: f32,
+    network_pan: [f32; 2],
+    /// 1×1 black texture sampled by any node input slot whose connection
+    /// is `None`. Lets `set_inputs` always supply `input_count` views
+    /// without rebuilding the bind-group layout when wires change.
+    #[allow(dead_code)]
+    stub_texture: wgpu::Texture,
+    stub_view: wgpu::TextureView,
+    /// Transient rubber-band wire shown while the user drags a new
+    /// connection. `Some([ax, ay, bx, by])` draws a single preview edge
+    /// each frame; cleared on drag end.
+    preview_wire: Option<[f32; 4]>,
 }
 
 /// Pixel thickness of the border drawn around each viewer thumbnail.
@@ -995,6 +1623,28 @@ const VIEWER_BORDER_PX: u32 = 6;
 const VIEWER_EYE_PX: u32 = 22;
 /// Inset of the eye icon from the thumbnail's top-left corner.
 const VIEWER_EYE_INSET_PX: u32 = 6;
+
+/// One terminal on a node's viewer — the start or end of a connection
+/// wire. Returned by `hit_test_port` so the lib.rs drag handler can
+/// distinguish output sources from input sinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortKind {
+    /// Sole output of a node — sits on the right edge of its viewer.
+    Output,
+    /// One of N input slots — left edge, evenly distributed top-to-bottom.
+    /// `slot` is the index into `inputs[]`.
+    Input { slot: usize },
+}
+
+/// A single terminal hit by a cursor: which node, which port, and the
+/// port's centre in physical pixels (so a drag rubber-band can anchor
+/// to it without recomputing the layout).
+#[derive(Debug, Clone, Copy)]
+pub struct PortHit {
+    pub node_index: usize,
+    pub kind: PortKind,
+    pub center: [f32; 2],
+}
 
 /// Region within a viewer thumbnail returned by `hit_test_viewer_region`.
 /// Lets the caller decide whether a click should toggle the preview
@@ -1086,6 +1736,7 @@ impl RenderGraph {
     /// before the first render.
     pub fn build(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         present_format: wgpu::TextureFormat,
         cfg: &GraphConfig,
     ) -> Result<Self, GraphError> {
@@ -1105,8 +1756,9 @@ impl RenderGraph {
                 input: cfg.out.input.clone(),
             })?;
 
-        // 3. Resolve inputs into upstream indices.
-        let mut input_indices: Vec<Vec<usize>> = Vec::with_capacity(cfg.nodes.len());
+        // 3. Resolve inputs into upstream indices. All build-time slots
+        //    are Some — disconnections only happen at runtime.
+        let mut input_indices: Vec<Vec<Option<usize>>> = Vec::with_capacity(cfg.nodes.len());
         for n in &cfg.nodes {
             let mut idxs = Vec::with_capacity(n.inputs.len());
             for input_id in &n.inputs {
@@ -1116,13 +1768,14 @@ impl RenderGraph {
                         input: input_id.clone(),
                     }
                 })?;
-                idxs.push(upstream);
+                idxs.push(Some(upstream));
             }
             input_indices.push(idxs);
         }
 
         // 4. Topological sort (DFS post-order with cycle detection).
-        let schedule = topo_sort(&cfg.nodes, &input_indices)?;
+        let ids: Vec<String> = cfg.nodes.iter().map(|n| n.id.clone()).collect();
+        let schedule = topo_sort(&ids, &input_indices)?;
 
         // 5. Instantiate nodes. Every node — present or not — renders into
         //    its own intermediate texture; an internal blit pass copies the
@@ -1155,6 +1808,28 @@ impl RenderGraph {
                         frag_src,
                         &n.id,
                         input_count,
+                    ))
+                }
+                // Passthrough sink — copies its single input into its
+                // own intermediate. Treated by the rest of the graph
+                // like any other node, so its viewer thumbnail just
+                // shows whatever upstream is wired to it. The present
+                // blit pulls from this node's intermediate when
+                // `[out].input` names it.
+                "out" => {
+                    if input_count != 1 {
+                        return Err(GraphError::OutNodeArity {
+                            id: n.id.clone(),
+                            got: input_count,
+                        });
+                    }
+                    Box::new(GlslNode::new(
+                        device,
+                        format,
+                        OUT_NODE_VERT,
+                        OUT_NODE_FRAG,
+                        &n.id,
+                        1,
                     ))
                 }
                 other => {
@@ -1196,6 +1871,24 @@ impl RenderGraph {
             "viewer-disabled",
         );
         let eye_overlay = EyeOverlay::new(device, present_format, "viewer-eye");
+        let graph_overlay = GraphOverlay::new(device, present_format, "graph-overlay");
+
+        // One label per viewer-enabled node. Format is "{id}  ({kind})"
+        // — both pieces of info the user asked for, separated visually
+        // so they read at a glance without overcrowding tight strings.
+        let label_pipeline = LabelPipeline::new(device, present_format);
+        let labels: Vec<Option<Label>> = cfg
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                if !viewer_configs[i].enabled {
+                    return None;
+                }
+                let text = format!("{}  ({})", n.id, n.kind);
+                Some(Label::new(device, queue, &label_pipeline, &text, &n.id))
+            })
+            .collect();
 
         log::info!(
             "render graph built: {} node(s), schedule = {:?}, present = {:?}, viewers = {:?}",
@@ -1239,7 +1932,30 @@ impl RenderGraph {
             .iter()
             .map(|e| format!("viewer-eye:{}", e.id))
             .collect();
+        let viewer_label_labels: Vec<String> = nodes
+            .iter()
+            .map(|e| format!("viewer-label:{}", e.id))
+            .collect();
         let viewer_preview_on = vec![true; nodes.len()];
+
+        // 1×1 black texture used for any input slot whose connection is
+        // None. Format must match INTERMEDIATE_FORMAT so it slots into
+        // the existing bind-group layout without changes.
+        let stub_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("graph:stub-input"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: INTERMEDIATE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let stub_view = stub_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         Ok(Self {
             nodes,
@@ -1254,6 +1970,11 @@ impl RenderGraph {
             border_fill,
             disabled_fill,
             eye_overlay,
+            label_pipeline,
+            labels,
+            viewer_label_labels,
+            graph_overlay,
+            graph_overlay_label: "graph-overlay".to_string(),
             viewer_preview_on,
             perf: None,
             schedule_labels,
@@ -1264,6 +1985,11 @@ impl RenderGraph {
             viewer_eye_labels,
             width: 0,
             height: 0,
+            network_zoom: 1.0,
+            network_pan: [0.0, 0.0],
+            stub_texture,
+            stub_view,
+            preview_wire: None,
         })
     }
 
@@ -1294,11 +2020,12 @@ impl RenderGraph {
     /// Convenience: parse + build from a raw TOML string.
     pub fn from_toml(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         present_format: wgpu::TextureFormat,
         toml_src: &str,
     ) -> Result<Self, GraphError> {
         let cfg = parse_config(toml_src).map_err(GraphError::Config)?;
-        Self::build(device, present_format, &cfg)
+        Self::build(device, queue, present_format, &cfg)
     }
 
     /// (Re)allocate intermediate textures, rebuild every node's bind
@@ -1332,15 +2059,20 @@ impl RenderGraph {
         }
 
         // Rebuild every node's bind group with fresh upstream views.
+        // Disconnected slots (`None`) get the stub texture so the bind
+        // group always carries `input_count` views.
         for i in 0..self.nodes.len() {
             let inputs = self.nodes[i].inputs.clone();
             let views: Vec<&wgpu::TextureView> = inputs
                 .iter()
-                .map(|&j| {
-                    &self.intermediates[j]
-                        .as_ref()
-                        .expect("upstream intermediate must be allocated")
-                        .view
+                .map(|slot| match slot {
+                    Some(j) => {
+                        &self.intermediates[*j]
+                            .as_ref()
+                            .expect("upstream intermediate must be allocated")
+                            .view
+                    }
+                    None => &self.stub_view,
                 })
                 .collect();
             self.nodes[i].impl_.set_inputs(device, &views);
@@ -1490,23 +2222,54 @@ impl RenderGraph {
         passes += 1;
 
         // PiP overlays — draw a solid border behind each viewer thumbnail
-        // and then blit the thumbnail on top of it. Skip silently when a
-        // thumbnail would overflow the canvas in either axis so a
-        // misconfigured offset doesn't blow up the render.
+        // and then blit the thumbnail on top of it. Everything is sized in
+        // screen space (post zoom/pan) so that scrolling the wheel scales
+        // the entire viewer — body, border, and eye icon — as a single
+        // unit. Skip silently when a thumbnail would overflow the canvas
+        // in either axis so a misconfigured offset (or extreme zoom)
+        // doesn't blow up the render.
+        let z = self.network_zoom;
         for i in 0..self.viewers.len() {
             let Some(v) = &self.viewers[i] else { continue };
-            let [x, y] = self.viewer_configs[i].position;
-            if x + v.width > ctx.width || y + v.height > ctx.height {
+            // Floating-point screen rect — the integer rect from
+            // viewer_rect() loses sub-pixel precision at high zoom, which
+            // shows up as the body and ports drifting apart. Recompute
+            // here in f32.
+            let cfg = &self.viewer_configs[i];
+            let sx = cfg.position[0] as f32 * z + self.network_pan[0];
+            let sy = cfg.position[1] as f32 * z + self.network_pan[1];
+            let sw = v.width as f32 * z;
+            let sh = v.height as f32 * z;
+            // Skip when the rect is entirely off-canvas. The other passes
+            // below clamp to the canvas — wgpu's set_viewport rejects
+            // out-of-bounds rects, and clamping with a fullscreen-triangle
+            // UV does cause some image stretch at the cropped edge, but
+            // letting the user zoom in past the edge is more important
+            // than perfect-fidelity edge framing.
+            if sx + sw <= 0.0
+                || sy + sh <= 0.0
+                || sx >= ctx.width as f32
+                || sy >= ctx.height as f32
+            {
                 continue;
             }
+            // Clamp the rect to the canvas so set_viewport stays valid.
+            let cw = ctx.width as f32;
+            let ch = ctx.height as f32;
+            let csx = sx.max(0.0);
+            let csy = sy.max(0.0);
+            let csw = (sx + sw).min(cw) - csx;
+            let csh = (sy + sh).min(ch) - csy;
 
-            // Border pass: expand the rect by VIEWER_BORDER_PX on every
-            // side, clamped to the canvas. Drawing the solid fill first
-            // and then the thumbnail on top leaves a visible ring.
-            let bx = x.saturating_sub(VIEWER_BORDER_PX);
-            let by = y.saturating_sub(VIEWER_BORDER_PX);
-            let bw = (v.width + VIEWER_BORDER_PX * 2).min(ctx.width - bx);
-            let bh = (v.height + VIEWER_BORDER_PX * 2).min(ctx.height - by);
+            // Border pass: expand the rect by a scaled border thickness
+            // on every side, clamped to the canvas. Drawing the solid
+            // fill first and then the thumbnail on top leaves a visible
+            // ring whose thickness tracks the zoom.
+            let border_px = VIEWER_BORDER_PX as f32 * z;
+            let bx = (sx - border_px).max(0.0);
+            let by = (sy - border_px).max(0.0);
+            let bw = ((sx + sw + border_px).min(cw) - bx).max(0.0);
+            let bh = ((sy + sh + border_px).min(ch) - by).max(0.0);
             let border_label = format!("{}:viewer:border-pass", self.nodes[i].id);
             let border_writes = self
                 .perf
@@ -1515,7 +2278,7 @@ impl RenderGraph {
             self.border_fill.record_overlay(
                 ctx.encoder,
                 ctx.output,
-                [bx as f32, by as f32, bw as f32, bh as f32],
+                [bx, by, bw, bh],
                 &border_label,
                 border_writes,
             );
@@ -1533,7 +2296,7 @@ impl RenderGraph {
                     ctx.encoder,
                     &v.pip_bg,
                     ctx.output,
-                    [x as f32, y as f32, v.width as f32, v.height as f32],
+                    [csx, csy, csw, csh],
                     &label,
                     writes,
                 );
@@ -1547,20 +2310,61 @@ impl RenderGraph {
                 self.disabled_fill.record_overlay(
                     ctx.encoder,
                     ctx.output,
-                    [x as f32, y as f32, v.width as f32, v.height as f32],
+                    [csx, csy, csw, csh],
                     &label,
                     writes,
                 );
             }
             passes += 1;
 
-            // Eye-icon overlay anchored top-left of the thumbnail. Always
-            // rendered (whether preview is on or off) so the user can
-            // click it to flip the state.
-            let ex = x + VIEWER_EYE_INSET_PX;
-            let ey = y + VIEWER_EYE_INSET_PX;
-            // Don't render the eye if it doesn't fit (e.g. tiny thumbnail).
-            if ex + VIEWER_EYE_PX <= ctx.width && ey + VIEWER_EYE_PX <= ctx.height {
+            // Per-node label: "id  (kind)" rendered below the thumbnail
+            // so the user can see what each viewer is at a glance.
+            // Centred horizontally on the thumbnail; falls outside the
+            // thumbnail rect when the label is wider, which is fine.
+            // Skipped silently if the label rect would land off-canvas.
+            if let Some(label) = &self.labels[i] {
+                let lw = label.width as f32 * z;
+                let lh = label.height as f32 * z;
+                let lx = sx + (sw - lw) * 0.5;
+                let ly = sy + sh + LABEL_GAP_PX as f32 * z;
+                let lcw = (lx + lw).min(cw) - lx.max(0.0);
+                let lch = (ly + lh).min(ch) - ly.max(0.0);
+                let visible = lx + lw > 0.0
+                    && ly + lh > 0.0
+                    && lx < cw
+                    && ly < ch
+                    && lcw > 0.0
+                    && lch > 0.0;
+                if visible {
+                    let lbl = format!("{}:viewer:label-pass", self.nodes[i].id);
+                    let writes = self
+                        .perf
+                        .as_mut()
+                        .and_then(|p| p.next_writes(&self.viewer_label_labels[i]));
+                    self.label_pipeline.record(
+                        ctx.encoder,
+                        ctx.output,
+                        [lx.max(0.0), ly.max(0.0), lcw, lch],
+                        &label.bind_group,
+                        &lbl,
+                        writes,
+                    );
+                    passes += 1;
+                }
+            }
+
+            // Eye-icon overlay anchored top-left of the thumbnail. Inset
+            // and size both scale with zoom so the icon stays centered on
+            // the same world point as the user wheels in/out.
+            let eye_inset = VIEWER_EYE_INSET_PX as f32 * z;
+            let eye_px = VIEWER_EYE_PX as f32 * z;
+            let ex = sx + eye_inset;
+            let ey = sy + eye_inset;
+            if ex >= 0.0
+                && ey >= 0.0
+                && ex + eye_px <= ctx.width as f32
+                && ey + eye_px <= ctx.height as f32
+            {
                 let eye_label = format!("{}:viewer:eye-pass", self.nodes[i].id);
                 let eye_writes = self
                     .perf
@@ -1569,17 +2373,120 @@ impl RenderGraph {
                 self.eye_overlay.record_overlay(
                     ctx.encoder,
                     ctx.output,
-                    [
-                        ex as f32,
-                        ey as f32,
-                        VIEWER_EYE_PX as f32,
-                        VIEWER_EYE_PX as f32,
-                    ],
+                    [ex, ey, eye_px, eye_px],
                     &eye_label,
                     eye_writes,
                 );
                 passes += 1;
             }
+        }
+
+        // Graph overlay — ports and connection lines drawn last so they
+        // sit on top of every thumbnail, border, and eye icon. Single
+        // pass over the whole canvas; uniform-driven SDFs produce all
+        // ports + edges in one fragment-shader sweep.
+        let mut uniforms = GraphOverlayUniforms {
+            canvas: [ctx.width as f32, ctx.height as f32],
+            port_count: 0,
+            edge_count: 0,
+            ports: [[0.0; 4]; MAX_GRAPH_PORTS],
+            edges: [[0.0; 4]; MAX_GRAPH_EDGES],
+        };
+
+        // Layout: each viewer-enabled node gets one output port (right
+        // edge midpoint) and N input ports (left edge, evenly
+        // distributed top-to-bottom). Ports are offset PORT_OFFSET_PX
+        // outward from the thumbnail border. Indices into uniforms.ports
+        // are stashed so we can reference them when emitting edges.
+        let mut output_port_idx: Vec<Option<u32>> = vec![None; self.nodes.len()];
+        // input_port_idx[node][slot] → uniforms.ports index.
+        let mut input_port_idx: Vec<Vec<Option<u32>>> =
+            self.nodes.iter().map(|n| vec![None; n.inputs.len()]).collect();
+
+        let mut next_port: usize = 0;
+        for i in 0..self.nodes.len() {
+            if !self.viewer_configs[i].enabled {
+                continue;
+            }
+            let Some([x, y, w, h]) = self.viewer_rect(i) else {
+                continue;
+            };
+            // Output port — right edge. kind=1.0 (output → orange).
+            if next_port < MAX_GRAPH_PORTS {
+                let px = x as f32 + w as f32 + PORT_OFFSET_PX;
+                let py = y as f32 + h as f32 * 0.5;
+                uniforms.ports[next_port] = [px, py, 1.0, 0.0];
+                output_port_idx[i] = Some(next_port as u32);
+                next_port += 1;
+            }
+            // Input ports — left edge, distributed evenly top-to-bottom.
+            // kind=0.0 (input → sky-blue).
+            let n_inputs = self.nodes[i].inputs.len();
+            for slot in 0..n_inputs {
+                if next_port >= MAX_GRAPH_PORTS {
+                    break;
+                }
+                let px = x as f32 - PORT_OFFSET_PX;
+                let py = y as f32 + h as f32 * (slot as f32 + 1.0) / (n_inputs as f32 + 1.0);
+                uniforms.ports[next_port] = [px, py, 0.0, 0.0];
+                input_port_idx[i][slot] = Some(next_port as u32);
+                next_port += 1;
+            }
+        }
+        uniforms.port_count = next_port as u32;
+
+        // Edges: for every node, walk its inputs. A connection exists
+        // between this node's input slot S and inputs[S]'s output port,
+        // provided both endpoints have a port (i.e. both have viewers)
+        // and the slot is connected (`Some`).
+        let mut next_edge: usize = 0;
+        for consumer_idx in 0..self.nodes.len() {
+            let inputs = self.nodes[consumer_idx].inputs.clone();
+            for (slot, slot_val) in inputs.iter().enumerate() {
+                if next_edge >= MAX_GRAPH_EDGES {
+                    break;
+                }
+                let Some(upstream_idx) = *slot_val else {
+                    continue;
+                };
+                let (Some(in_idx), Some(out_idx)) =
+                    (input_port_idx[consumer_idx][slot], output_port_idx[upstream_idx])
+                else {
+                    continue;
+                };
+                let a = uniforms.ports[out_idx as usize];
+                let b = uniforms.ports[in_idx as usize];
+                uniforms.edges[next_edge] = [a[0], a[1], b[0], b[1]];
+                next_edge += 1;
+            }
+        }
+        uniforms.edge_count = next_edge as u32;
+
+        // Append the rubber-band preview wire on top of the committed
+        // edges. Drawn last so the user sees their drag clearly even
+        // when it crosses an existing wire.
+        if let Some(wire) = self.preview_wire {
+            if (uniforms.edge_count as usize) < MAX_GRAPH_EDGES {
+                uniforms.edges[uniforms.edge_count as usize] = wire;
+                uniforms.edge_count += 1;
+            }
+        }
+
+        if uniforms.port_count > 0 || uniforms.edge_count > 0 {
+            self.graph_overlay.upload(ctx.queue, &uniforms);
+            let writes = self
+                .perf
+                .as_mut()
+                .and_then(|p| p.next_writes(&self.graph_overlay_label));
+            self.graph_overlay.record(
+                ctx.encoder,
+                ctx.output,
+                ctx.width,
+                ctx.height,
+                "graph-overlay:pass",
+                writes,
+            );
+            passes += 1;
         }
 
         // Resolve query set + copy into a readback buffer (no-op when the
@@ -1600,8 +2507,13 @@ impl RenderGraph {
         let mut depths = vec![0u32; self.nodes.len()];
         for &i in &self.schedule {
             let entry = &self.nodes[i];
-            if !entry.inputs.is_empty() {
-                let max_d = entry.inputs.iter().map(|&j| depths[j]).max().unwrap_or(0);
+            // Disconnected slots contribute no depth.
+            let max_d = entry
+                .inputs
+                .iter()
+                .filter_map(|s| s.map(|j| depths[j]))
+                .max();
+            if let Some(max_d) = max_d {
                 depths[i] = max_d + 1;
             }
         }
@@ -1669,11 +2581,156 @@ impl RenderGraph {
 
     /// Returns the on-screen rectangle of a viewer thumbnail in physical
     /// pixels (`[x, y, width, height]`), or `None` if the index is out
-    /// of range or that node has no viewer enabled.
+    /// of range or that node has no viewer enabled. Applies the network-
+    /// viewer affine — the stored `position`/`resolution` are world
+    /// coords, and `network_zoom` + `network_pan` map them to the screen.
     pub fn viewer_rect(&self, viewer_index: usize) -> Option<[u32; 4]> {
         let v = self.viewers.get(viewer_index)?.as_ref()?;
         let cfg = self.viewer_configs.get(viewer_index)?;
-        Some([cfg.position[0], cfg.position[1], v.width, v.height])
+        let z = self.network_zoom;
+        let sx = cfg.position[0] as f32 * z + self.network_pan[0];
+        let sy = cfg.position[1] as f32 * z + self.network_pan[1];
+        let sw = v.width as f32 * z;
+        let sh = v.height as f32 * z;
+        Some([
+            sx.max(0.0) as u32,
+            sy.max(0.0) as u32,
+            sw.max(0.0) as u32,
+            sh.max(0.0) as u32,
+        ])
+    }
+
+    /// Apply a multiplicative zoom factor to the network-viewer transform,
+    /// anchored at `cursor` (physical pixels, screen space). The point
+    /// under the cursor stays put; everything else scales around it.
+    /// Zoom is clamped to a sensible UI range.
+    pub fn zoom_network(&mut self, cursor: [f32; 2], factor: f32) {
+        let new_zoom = (self.network_zoom * factor).clamp(0.25, 8.0);
+        let actual = new_zoom / self.network_zoom;
+        self.network_pan[0] = cursor[0] - (cursor[0] - self.network_pan[0]) * actual;
+        self.network_pan[1] = cursor[1] - (cursor[1] - self.network_pan[1]) * actual;
+        self.network_zoom = new_zoom;
+    }
+
+    /// Connect `upstream` to `consumer`'s `slot`. Validates that the
+    /// new wiring is acyclic; if it would create a cycle the original
+    /// wiring is restored and the function returns `false`. On success,
+    /// rebuilds the schedule and refreshes every node's bind group.
+    pub fn connect_input(
+        &mut self,
+        device: &wgpu::Device,
+        consumer: usize,
+        slot: usize,
+        upstream: usize,
+    ) -> bool {
+        if consumer >= self.nodes.len() || upstream >= self.nodes.len() {
+            return false;
+        }
+        let Some(slot_ref) = self.nodes[consumer].inputs.get(slot) else {
+            return false;
+        };
+        // Self-loops are disallowed (cycle of length 1).
+        if upstream == consumer {
+            return false;
+        }
+        let prev = *slot_ref;
+        self.nodes[consumer].inputs[slot] = Some(upstream);
+        if let Err(_) = self.try_resort() {
+            // Cycle — revert.
+            self.nodes[consumer].inputs[slot] = prev;
+            return false;
+        }
+        self.refresh_bind_groups(device);
+        true
+    }
+
+    /// Detach `consumer`'s input `slot` (sets it to None). Returns
+    /// `true` if there was actually a connection to remove.
+    pub fn disconnect_input(
+        &mut self,
+        device: &wgpu::Device,
+        consumer: usize,
+        slot: usize,
+    ) -> bool {
+        if consumer >= self.nodes.len() {
+            return false;
+        }
+        let Some(slot_ref) = self.nodes[consumer].inputs.get_mut(slot) else {
+            return false;
+        };
+        if slot_ref.is_none() {
+            return false;
+        }
+        *slot_ref = None;
+        // Removing an edge can never create a cycle, so try_resort can't
+        // fail here — but call it anyway to refresh the schedule.
+        let _ = self.try_resort();
+        self.refresh_bind_groups(device);
+        true
+    }
+
+    /// Re-run topological sort against the current `nodes[].inputs`.
+    /// Used by connect/disconnect to update `self.schedule` after a
+    /// runtime wiring change.
+    fn try_resort(&mut self) -> Result<(), GraphError> {
+        let ids: Vec<String> = self.nodes.iter().map(|n| n.id.clone()).collect();
+        let inputs: Vec<Vec<Option<usize>>> =
+            self.nodes.iter().map(|n| n.inputs.clone()).collect();
+        let order = topo_sort(&ids, &inputs)?;
+        self.schedule = order;
+        Ok(())
+    }
+
+    /// Walk every node and rebuild its bind group from the current
+    /// `inputs` wiring. Disconnected slots (`None`) get the stub view.
+    fn refresh_bind_groups(&mut self, device: &wgpu::Device) {
+        for i in 0..self.nodes.len() {
+            let inputs = self.nodes[i].inputs.clone();
+            let views: Vec<&wgpu::TextureView> = inputs
+                .iter()
+                .map(|slot| match slot {
+                    Some(j) => match self.intermediates[*j].as_ref() {
+                        Some(v) => &v.view,
+                        // Resize hasn't run yet — fall back to stub.
+                        None => &self.stub_view,
+                    },
+                    None => &self.stub_view,
+                })
+                .collect();
+            self.nodes[i].impl_.set_inputs(device, &views);
+        }
+    }
+
+    /// Set the rubber-band preview wire shown while the user is
+    /// dragging a connection. `None` clears it. The endpoints are in
+    /// physical pixels (screen space). Drawn on the next render() call.
+    pub fn set_preview_wire(&mut self, wire: Option<[f32; 4]>) {
+        self.preview_wire = wire;
+    }
+
+    /// Translate the network-viewer transform by a screen-space delta.
+    /// Used by drag-to-pan on empty canvas; no zoom adjustment because
+    /// pan is the additive term in `screen = world * zoom + pan`.
+    pub fn pan_network(&mut self, delta: [f32; 2]) {
+        self.network_pan[0] += delta[0];
+        self.network_pan[1] += delta[1];
+    }
+
+    /// Inverse of the network affine — convert a screen-space point to
+    /// the world-space coordinate that maps to it. Used by drag so the
+    /// stored `viewer.position` stays in world coords regardless of zoom.
+    pub fn screen_to_world(&self, screen: [f32; 2]) -> [f32; 2] {
+        let z = self.network_zoom.max(1e-6);
+        [
+            (screen[0] - self.network_pan[0]) / z,
+            (screen[1] - self.network_pan[1]) / z,
+        ]
+    }
+
+    /// Current zoom factor (1.0 = identity). Read by lib.rs to scale
+    /// drag deltas from screen-space to world-space.
+    pub fn network_zoom(&self) -> f32 {
+        self.network_zoom
     }
 
     /// Update a viewer's pixel offset at runtime (e.g. from a drag
@@ -1709,18 +2766,80 @@ impl RenderGraph {
     pub fn hit_test_viewer_region(&self, cursor: [u32; 2]) -> Option<(usize, ViewerRegion)> {
         let i = self.hit_test_viewer(cursor)?;
         let [x, y, _, _] = self.viewer_rect(i)?;
-        let ex = x + VIEWER_EYE_INSET_PX;
-        let ey = y + VIEWER_EYE_INSET_PX;
-        let region = if cursor[0] >= ex
-            && cursor[0] < ex + VIEWER_EYE_PX
-            && cursor[1] >= ey
-            && cursor[1] < ey + VIEWER_EYE_PX
-        {
+        // Inset and size scale with the network zoom so the click region
+        // matches the rendered eye icon.
+        let z = self.network_zoom;
+        let ex = x as f32 + VIEWER_EYE_INSET_PX as f32 * z;
+        let ey = y as f32 + VIEWER_EYE_INSET_PX as f32 * z;
+        let eye_px = VIEWER_EYE_PX as f32 * z;
+        let cx = cursor[0] as f32;
+        let cy = cursor[1] as f32;
+        let region = if cx >= ex && cx < ex + eye_px && cy >= ey && cy < ey + eye_px {
             ViewerRegion::Eye
         } else {
             ViewerRegion::Body
         };
         Some((i, region))
+    }
+
+    /// Iterator over every visible port across every viewer-enabled
+    /// node. Yields one entry per port — output then inputs in slot
+    /// order. Geometry mirrors the GraphOverlay layout so wires snap to
+    /// exactly what the user sees.
+    pub fn ports(&self) -> Vec<PortHit> {
+        let mut out = Vec::new();
+        for i in 0..self.nodes.len() {
+            if !self.viewer_configs[i].enabled {
+                continue;
+            }
+            let Some([x, y, w, h]) = self.viewer_rect(i) else {
+                continue;
+            };
+            // Output port — right edge midpoint.
+            out.push(PortHit {
+                node_index: i,
+                kind: PortKind::Output,
+                center: [x as f32 + w as f32 + PORT_OFFSET_PX, y as f32 + h as f32 * 0.5],
+            });
+            // Input ports — left edge, evenly distributed.
+            let n_inputs = self.nodes[i].inputs.len();
+            for slot in 0..n_inputs {
+                out.push(PortHit {
+                    node_index: i,
+                    kind: PortKind::Input { slot },
+                    center: [
+                        x as f32 - PORT_OFFSET_PX,
+                        y as f32 + h as f32 * (slot as f32 + 1.0) / (n_inputs as f32 + 1.0),
+                    ],
+                });
+            }
+        }
+        out
+    }
+
+    /// Find the port whose centre is closest to `cursor` and within the
+    /// hit radius (slightly bigger than the visible port for forgiving
+    /// clicks). Returns `None` if no port is in range.
+    pub fn hit_test_port(&self, cursor: [f32; 2]) -> Option<PortHit> {
+        // Hit radius scales with zoom for consistent feel: at zoom=2 the
+        // visible port is twice as big, so the click region grows too.
+        let z = self.network_zoom.max(1e-6);
+        let r = (PORT_RADIUS_PX + 4.0) * z;
+        let r2 = r * r;
+        self.ports()
+            .into_iter()
+            .filter(|p| {
+                let dx = cursor[0] - p.center[0];
+                let dy = cursor[1] - p.center[1];
+                dx * dx + dy * dy <= r2
+            })
+            .min_by(|a, b| {
+                let da =
+                    (cursor[0] - a.center[0]).powi(2) + (cursor[1] - a.center[1]).powi(2);
+                let db =
+                    (cursor[0] - b.center[0]).powi(2) + (cursor[1] - b.center[1]).powi(2);
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
     }
 
     /// Flip a viewer's runtime preview on/off. When off, the thumbnail
@@ -1754,10 +2873,11 @@ impl RenderGraph {
 
 /// DFS post-order topological sort. Returns indices in execution order
 /// (every input precedes its consumer). Reports the first node it finds
-/// inside a cycle.
+/// inside a cycle. Slots set to `None` are skipped — they represent
+/// disconnected inputs and contribute no edges.
 fn topo_sort(
-    nodes: &[NodeConfig],
-    inputs: &[Vec<usize>],
+    ids: &[String],
+    inputs: &[Vec<Option<usize>>],
 ) -> Result<Vec<usize>, GraphError> {
     #[derive(Copy, Clone, PartialEq, Eq)]
     enum Mark {
@@ -1766,7 +2886,7 @@ fn topo_sort(
         Done,
     }
 
-    let n = nodes.len();
+    let n = ids.len();
     let mut marks = vec![Mark::Unseen; n];
     let mut order = Vec::with_capacity(n);
 
@@ -1785,14 +2905,16 @@ fn topo_sort(
 
         while let Some(&(top, next)) = stack.last() {
             if next < inputs[top].len() {
-                let upstream = inputs[top][next];
                 // Advance the cursor on the parent.
                 stack.last_mut().unwrap().1 += 1;
+                let Some(upstream) = inputs[top][next] else {
+                    continue;
+                };
                 match marks[upstream] {
                     Mark::Done => {}
                     Mark::InProgress => {
                         return Err(GraphError::CycleInvolving {
-                            node: nodes[upstream].id.clone(),
+                            node: ids[upstream].clone(),
                         });
                     }
                     Mark::Unseen => {

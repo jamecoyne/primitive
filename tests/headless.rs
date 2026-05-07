@@ -135,7 +135,7 @@ fn viewer_textures_match_config() {
             })
             .await
             .expect("no adapter");
-        let (device, _queue) = adapter
+        let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("viewer-test-device"),
@@ -150,6 +150,7 @@ fn viewer_textures_match_config() {
 
         let mut graph = RenderGraph::from_toml(
             &device,
+            &queue,
             wgpu::TextureFormat::Rgba8UnormSrgb,
             DEFAULT_GRAPH_TOML,
         )

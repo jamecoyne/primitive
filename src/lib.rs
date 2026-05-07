@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
@@ -12,7 +12,7 @@ use wasm_bindgen::prelude::*;
 pub mod hud;
 pub mod render_graph;
 use hud::Hud;
-use render_graph::{NodeContext, RenderGraph, ViewerRegion, DEFAULT_GRAPH_TOML};
+use render_graph::{NodeContext, PortHit, PortKind, RenderGraph, ViewerRegion, DEFAULT_GRAPH_TOML};
 
 /// Test-mode overrides parsed from URL params on web. None on native.
 /// When `time` is Some, the time uniform is frozen at that value. When
@@ -58,20 +58,40 @@ struct State {
     /// pixels). Tracked even while dragging so we always know where the
     /// pointer is on `MouseInput`.
     cursor_pos: [f32; 2],
-    /// Active viewer-thumbnail drag, if any. While `Some`, the cursor's
-    /// CursorMoved updates the dragged viewer's position instead of the
-    /// mandelbrot uniform. Cleared on left-button release.
-    dragging: Option<DragState>,
+    /// Active drag, if any. While `Some`, CursorMoved either repositions
+    /// a viewer thumbnail or pans the network — see `Drag` — instead of
+    /// updating the mandelbrot mouse uniform. Cleared on left-button release.
+    dragging: Option<Drag>,
 }
 
 #[derive(Clone, Copy)]
-struct DragState {
-    /// Index into `RenderGraph::viewer_textures()` (== node index).
-    viewer_index: usize,
-    /// Cursor → viewer-top-left offset captured at drag start, in
-    /// physical pixels. Subtracted from cursor each frame to keep the
-    /// drag-grab point under the pointer.
-    grab_offset: [f32; 2],
+enum Drag {
+    /// Repositioning a single viewer thumbnail. Activated by pressing
+    /// inside a thumbnail body (eye region toggles preview instead).
+    Viewer {
+        /// Index into `RenderGraph::viewer_textures()` (== node index).
+        viewer_index: usize,
+        /// Cursor → viewer-top-left offset captured at drag start, in
+        /// physical pixels. Subtracted from cursor each frame to keep
+        /// the drag-grab point under the pointer.
+        grab_offset: [f32; 2],
+    },
+    /// Panning the entire network viewer. Activated by pressing on
+    /// empty canvas (anywhere not on a viewer). Each cursor delta is
+    /// added directly to `network_pan` since pan is screen-space.
+    Pan {
+        /// Cursor position the last time we processed a delta. Updated
+        /// every CursorMoved while panning.
+        last_cursor: [f32; 2],
+    },
+    /// Drawing or rerouting a connection wire. Started by pressing on
+    /// any port. While active, a rubber-band line is drawn from the
+    /// origin port to the cursor (or snapped to a hovered target port).
+    /// On release the appropriate connect/disconnect runs.
+    Wire {
+        /// Origin port (where the press happened).
+        origin: PortHit,
+    },
 }
 
 const FRAME_WINDOW: usize = 60;
@@ -79,6 +99,37 @@ const FRAME_WINDOW: usize = 60;
 /// Returns the sRGB-encoding sibling of a format if one exists, else the
 /// format itself. Lets us write linear shader output through an sRGB view
 /// even when the underlying canvas storage is non-sRGB.
+/// Resolve a wire-drag release: connect, rewire, or disconnect based on
+/// where the drag started and where it ended. Connection rules:
+///   - Output → Input  : connect (or rewire if input was already used)
+///   - Input  → Output : connect (or rewire) — bidirectional
+///   - Input  → empty  : disconnect that input
+///   - Anything else   : no-op (cancel)
+fn handle_wire_release(
+    graph: &mut RenderGraph,
+    device: &wgpu::Device,
+    origin: PortHit,
+    cursor: [f32; 2],
+) {
+    let target = graph.hit_test_port(cursor);
+    match (origin.kind, target.map(|t| (t.node_index, t.kind))) {
+        // Output → Input slot: connect that input to the origin's node.
+        (PortKind::Output, Some((target_node, PortKind::Input { slot }))) => {
+            graph.connect_input(device, target_node, slot, origin.node_index);
+        }
+        // Input → Output: connect origin's input slot to the target node.
+        (PortKind::Input { slot }, Some((target_node, PortKind::Output))) => {
+            graph.connect_input(device, origin.node_index, slot, target_node);
+        }
+        // Input → no port: disconnect.
+        (PortKind::Input { slot }, None) => {
+            graph.disconnect_input(device, origin.node_index, slot);
+        }
+        // Output → empty, port-of-same-kind, or self → no-op.
+        _ => {}
+    }
+}
+
 fn srgb_view_of(format: wgpu::TextureFormat) -> wgpu::TextureFormat {
     use wgpu::TextureFormat::*;
     match format {
@@ -189,7 +240,7 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        let mut graph = RenderGraph::from_toml(&device, view_format, DEFAULT_GRAPH_TOML)
+        let mut graph = RenderGraph::from_toml(&device, &queue, view_format, DEFAULT_GRAPH_TOML)
             .unwrap_or_else(|e| panic!("config/graph.toml: {e}"));
         // Allocate intermediates + bind groups for the initial canvas size.
         // resize() must run before the first render.
@@ -490,19 +541,60 @@ impl ApplicationHandler<UserEvent> for App {
                 let cursor = [position.x as f32, position.y as f32];
                 state.cursor_pos = cursor;
                 if let Some(drag) = state.dragging {
-                    // Convert cursor → desired thumbnail top-left, clamp
-                    // to canvas, push into the graph. The thumbnail's
-                    // size doesn't change so we read it from
-                    // `viewer_rect`.
-                    if let Some([_, _, w, h]) = state.graph.viewer_rect(drag.viewer_index) {
-                        let nx = (cursor[0] - drag.grab_offset[0]).max(0.0) as u32;
-                        let ny = (cursor[1] - drag.grab_offset[1]).max(0.0) as u32;
-                        let max_x = state.config.width.saturating_sub(w);
-                        let max_y = state.config.height.saturating_sub(h);
-                        state.graph.set_viewer_position(
-                            drag.viewer_index,
-                            [nx.min(max_x), ny.min(max_y)],
-                        );
+                    match drag {
+                        Drag::Viewer {
+                            viewer_index,
+                            grab_offset,
+                        } => {
+                            // grab_offset is in screen space; convert the
+                            // desired screen-top-left to world space
+                            // before storing, since viewer.position is
+                            // the world coord that viewer_rect()
+                            // multiplies by network_zoom.
+                            if let Some([_, _, w, h]) = state.graph.viewer_rect(viewer_index) {
+                                let screen = [
+                                    cursor[0] - grab_offset[0],
+                                    cursor[1] - grab_offset[1],
+                                ];
+                                let world = state.graph.screen_to_world(screen);
+                                let nx = world[0].max(0.0) as u32;
+                                let ny = world[1].max(0.0) as u32;
+                                let z = state.graph.network_zoom().max(1e-6);
+                                let max_x =
+                                    (state.config.width.saturating_sub(w) as f32 / z) as u32;
+                                let max_y =
+                                    (state.config.height.saturating_sub(h) as f32 / z) as u32;
+                                state.graph.set_viewer_position(
+                                    viewer_index,
+                                    [nx.min(max_x), ny.min(max_y)],
+                                );
+                            }
+                        }
+                        Drag::Pan { last_cursor } => {
+                            let delta = [cursor[0] - last_cursor[0], cursor[1] - last_cursor[1]];
+                            state.graph.pan_network(delta);
+                            state.dragging = Some(Drag::Pan {
+                                last_cursor: cursor,
+                            });
+                        }
+                        Drag::Wire { origin } => {
+                            // Snap the rubber-band end to the nearest
+                            // port if the cursor is hovering one. Gives
+                            // a clear visual confirmation of "you're
+                            // about to land on this terminal" before
+                            // the user releases.
+                            let end = state
+                                .graph
+                                .hit_test_port(cursor)
+                                .map(|p| p.center)
+                                .unwrap_or(cursor);
+                            state.graph.set_preview_wire(Some([
+                                origin.center[0],
+                                origin.center[1],
+                                end[0],
+                                end[1],
+                            ]));
+                        }
                     }
                 } else if state.lock.mouse_uv.is_none() {
                     state.mouse = cursor;
@@ -521,32 +613,74 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 match button_state {
                     ElementState::Pressed => {
-                        let cu = [state.cursor_pos[0] as u32, state.cursor_pos[1] as u32];
-                        match state.graph.hit_test_viewer_region(cu) {
-                            Some((idx, ViewerRegion::Eye)) => {
-                                // Toggle the per-viewer preview. Don't
-                                // start a drag; the user is interacting
-                                // with the icon, not the thumbnail body.
-                                let _ = state.graph.toggle_viewer_preview(idx);
-                            }
-                            Some((idx, ViewerRegion::Body)) => {
-                                if let Some([rx, ry, _, _]) = state.graph.viewer_rect(idx) {
-                                    state.dragging = Some(DragState {
-                                        viewer_index: idx,
-                                        grab_offset: [
-                                            state.cursor_pos[0] - rx as f32,
-                                            state.cursor_pos[1] - ry as f32,
-                                        ],
+                        // Hit-test priority: port (most specific) > eye >
+                        // viewer body > empty canvas (pan).
+                        if let Some(origin) = state.graph.hit_test_port(state.cursor_pos) {
+                            // Seed the rubber-band so the first paint
+                            // shows the wire even before CursorMoved
+                            // fires.
+                            state.graph.set_preview_wire(Some([
+                                origin.center[0],
+                                origin.center[1],
+                                state.cursor_pos[0],
+                                state.cursor_pos[1],
+                            ]));
+                            state.dragging = Some(Drag::Wire { origin });
+                        } else {
+                            let cu = [state.cursor_pos[0] as u32, state.cursor_pos[1] as u32];
+                            match state.graph.hit_test_viewer_region(cu) {
+                                Some((idx, ViewerRegion::Eye)) => {
+                                    let _ = state.graph.toggle_viewer_preview(idx);
+                                }
+                                Some((idx, ViewerRegion::Body)) => {
+                                    if let Some([rx, ry, _, _]) = state.graph.viewer_rect(idx) {
+                                        state.dragging = Some(Drag::Viewer {
+                                            viewer_index: idx,
+                                            grab_offset: [
+                                                state.cursor_pos[0] - rx as f32,
+                                                state.cursor_pos[1] - ry as f32,
+                                            ],
+                                        });
+                                    }
+                                }
+                                None => {
+                                    state.dragging = Some(Drag::Pan {
+                                        last_cursor: state.cursor_pos,
                                     });
                                 }
                             }
-                            None => {}
                         }
                     }
                     ElementState::Released => {
+                        // Wire-drag finishes any rewire/disconnect work
+                        // when handled in the cursor-move case below.
+                        // Always clear the rubber-band on release.
+                        if let Some(Drag::Wire { origin }) = state.dragging {
+                            handle_wire_release(&mut state.graph, &state.device, origin, state.cursor_pos);
+                            state.graph.set_preview_wire(None);
+                        }
                         state.dragging = None;
                     }
                 }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Determinism gate: tests pin the cursor via `lock.mouse_uv`
+                // and don't generate wheel events, but skip explicitly so
+                // accidental synthetic input can't perturb baselines.
+                if state.lock.mouse_uv.is_some() {
+                    return;
+                }
+                // Both LineDelta and PixelDelta carry "vertical scroll up
+                // is positive", which we map to zoom-in. The exponent base
+                // (1.1 / line, 1.0015 / pixel) gives a feel close to most
+                // 2D node-graph editors. Cursor is the anchor so the spot
+                // under the pointer stays fixed across the zoom.
+                let factor = match delta {
+                    MouseScrollDelta::LineDelta(_, dy) => 1.1f32.powf(dy),
+                    MouseScrollDelta::PixelDelta(p) => 1.0015f32.powf(p.y as f32),
+                };
+                state.graph.zoom_network(state.cursor_pos, factor);
+                state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
                 match state.render() {
@@ -728,7 +862,7 @@ pub async fn render_offscreen(cfg: RenderConfig) -> Vec<u8> {
         .expect("offscreen: request_device");
 
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let mut graph = RenderGraph::from_toml(&device, format, DEFAULT_GRAPH_TOML)
+    let mut graph = RenderGraph::from_toml(&device, &queue, format, DEFAULT_GRAPH_TOML)
         .unwrap_or_else(|e| panic!("config/graph.toml: {e}"));
     graph.resize(&device, cfg.width, cfg.height);
 
