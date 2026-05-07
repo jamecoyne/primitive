@@ -21,6 +21,8 @@ raw-window-handle = "0.6"
 # Render-graph config is loaded from TOML at compile time via include_str!
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+# 8×8 ASCII bitmap font used by the HUD overlay (~700 bytes of font data).
+font8x8 = { version = "0.3", default-features = false, features = ["unicode"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env_logger = "0.11"

@@ -701,7 +701,6 @@ pub struct RenderGraph {
 ///     (target = present_format) to overlay the thumbnail on the
 ///     swapchain.
 struct Viewer {
-    #[allow(dead_code)]
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     width: u32,
@@ -720,7 +719,6 @@ pub struct ViewerSlot<'a> {
 }
 
 struct Intermediate {
-    #[allow(dead_code)]
     texture: wgpu::Texture,
     view: wgpu::TextureView,
 }
@@ -1034,6 +1032,26 @@ impl RenderGraph {
                 &label,
             );
         }
+    }
+
+    /// Sum of bytes the graph currently has allocated in intermediate
+    /// and viewer textures (assumes 4 bytes/pixel — Rgba8). Powers the
+    /// `Mem:` line of the HUD.
+    pub fn allocated_bytes(&self) -> u64 {
+        let mut bytes: u64 = 0;
+        for inter in &self.intermediates {
+            if let Some(i) = inter {
+                let s = i.texture.size();
+                bytes += s.width as u64 * s.height as u64 * 4;
+            }
+        }
+        for viewer in &self.viewers {
+            if let Some(v) = viewer {
+                let s = v.texture.size();
+                bytes += s.width as u64 * s.height as u64 * 4;
+            }
+        }
+        bytes
     }
 
     /// Returns a slot for every node where `viewer.enabled = true`. The

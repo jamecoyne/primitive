@@ -9,7 +9,9 @@ use winit::window::{Window, WindowId};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+pub mod hud;
 pub mod render_graph;
+use hud::{backend_label, gpu_label, Hud};
 use render_graph::{NodeContext, RenderGraph, DEFAULT_GRAPH_TOML};
 
 /// Test-mode overrides parsed from URL params on web. None on native.
@@ -37,7 +39,18 @@ struct State {
     start: web_time::Instant,
     mouse: [f32; 2],
     lock: TestLock,
+    // HUD overlay — adapter info, allocated bytes, rolling FPS. Hidden
+    // when `lock` has any field set so the headless screenshot harness
+    // can still produce byte-identical frames.
+    hud: Hud,
+    adapter_info: wgpu::AdapterInfo,
+    last_frame: Option<web_time::Instant>,
+    /// Ring of recent frame times in seconds (most recent at the back).
+    /// Capped at FRAME_WINDOW; FPS is N / sum(window).
+    frame_times: std::collections::VecDeque<f32>,
 }
+
+const FRAME_WINDOW: usize = 60;
 
 /// Returns the sRGB-encoding sibling of a format if one exists, else the
 /// format itself. Lets us write linear shader output through an sRGB view
@@ -78,7 +91,8 @@ impl State {
             .await
             .expect("no compatible adapter");
 
-        log::info!("adapter: {:?}", adapter.get_info());
+        let adapter_info = adapter.get_info();
+        log::info!("adapter: {:?}", adapter_info);
 
         let required_limits = if cfg!(target_arch = "wasm32") {
             wgpu::Limits::downlevel_webgl2_defaults()
@@ -136,6 +150,8 @@ impl State {
         // resize() must run before the first render.
         graph.resize(&device, size.width, size.height);
 
+        let hud = Hud::new(&device, view_format);
+
         let default_mouse = [size.width as f32 * 0.5, size.height as f32 * 0.5];
         let mouse = match lock.mouse_uv {
             Some([u, v]) => [u * size.width as f32, v * size.height as f32],
@@ -152,6 +168,10 @@ impl State {
             start: web_time::Instant::now(),
             mouse,
             lock,
+            hud,
+            adapter_info,
+            last_frame: None,
+            frame_times: std::collections::VecDeque::with_capacity(FRAME_WINDOW),
         }
     }
 
@@ -174,6 +194,22 @@ impl State {
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        // Frame timing — measure before doing any GPU work so the
+        // wall-clock dt is roughly "frame to frame" from the renderer's
+        // POV. Skipped on the very first frame (no prior timestamp).
+        let now = web_time::Instant::now();
+        if let Some(prev) = self.last_frame {
+            let dt = now.duration_since(prev).as_secs_f32();
+            // Guard against bad timestamps (shouldn't happen but cheap).
+            if dt > 0.0 && dt < 1.0 {
+                if self.frame_times.len() == FRAME_WINDOW {
+                    self.frame_times.pop_front();
+                }
+                self.frame_times.push_back(dt);
+            }
+        }
+        self.last_frame = Some(now);
+
         let frame = self.surface.get_current_texture()?;
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.view_format),
@@ -200,6 +236,44 @@ impl State {
             mouse: self.mouse,
         };
         self.graph.render(&mut ctx);
+
+        // HUD overlay — render on top of the graph output. Hidden when a
+        // test lock is set so the screenshot harness gets byte-identical
+        // frames; otherwise frame-time and adapter-name jitter would
+        // break cross-platform parity.
+        if self.lock.time.is_none() && self.lock.mouse_uv.is_none() {
+            let fps = if self.frame_times.is_empty() {
+                0.0
+            } else {
+                let sum: f32 = self.frame_times.iter().sum();
+                self.frame_times.len() as f32 / sum
+            };
+            let mem_mib = self.graph.allocated_bytes() as f32 / (1024.0 * 1024.0);
+            let text = format!(
+                "GPU:     {}\nBackend: {}\nMem:     {:.2} MiB\nFPS:     {:.1}",
+                gpu_label(&self.adapter_info),
+                backend_label(self.adapter_info.backend),
+                mem_mib,
+                fps,
+            );
+            self.hud.set_text(&self.queue, &text);
+
+            const HUD_MARGIN: u32 = 16;
+            let hud_w = self.hud.width;
+            let hud_h = self.hud.height;
+            let canvas_w = self.config.width;
+            let canvas_h = self.config.height;
+            // Bottom-right anchor; skip if the HUD wouldn't fit.
+            if hud_w + HUD_MARGIN <= canvas_w && hud_h + HUD_MARGIN <= canvas_h {
+                let viewport = [
+                    (canvas_w - hud_w - HUD_MARGIN) as f32,
+                    (canvas_h - hud_h - HUD_MARGIN) as f32,
+                    hud_w as f32,
+                    hud_h as f32,
+                ];
+                self.hud.record(&mut encoder, &view, viewport);
+            }
+        }
 
         self.queue.submit(Some(encoder.finish()));
         frame.present();
