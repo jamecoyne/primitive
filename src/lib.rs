@@ -130,8 +130,11 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        let graph = RenderGraph::from_toml(&device, view_format, DEFAULT_GRAPH_TOML)
+        let mut graph = RenderGraph::from_toml(&device, view_format, DEFAULT_GRAPH_TOML)
             .expect("config/graph.toml is valid at compile time");
+        // Allocate intermediates + bind groups for the initial canvas size.
+        // resize() must run before the first render.
+        graph.resize(&device, size.width, size.height);
 
         let default_mouse = [size.width as f32 * 0.5, size.height as f32 * 0.5];
         let mouse = match lock.mouse_uv {
@@ -159,6 +162,9 @@ impl State {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
+        // Reallocate the graph's intermediate textures and rebuild bind
+        // groups so downstream nodes sample from the new sizes.
+        self.graph.resize(&self.device, size.width, size.height);
         // When the cursor is pinned via test lock, keep it pinned in uv space
         // even as the canvas resizes — otherwise locked-frame screenshots
         // would drift after the first ResizeObserver event on web.
@@ -442,8 +448,9 @@ pub async fn render_offscreen(cfg: RenderConfig) -> Vec<u8> {
         .expect("offscreen: request_device");
 
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let graph = RenderGraph::from_toml(&device, format, DEFAULT_GRAPH_TOML)
+    let mut graph = RenderGraph::from_toml(&device, format, DEFAULT_GRAPH_TOML)
         .expect("config/graph.toml is valid at compile time");
+    graph.resize(&device, cfg.width, cfg.height);
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("offscreen-target"),
