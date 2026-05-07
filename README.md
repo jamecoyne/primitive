@@ -15,6 +15,9 @@ Primative is my experiment with trying to create a rust baseed real time video g
 
 **Primative, Mathematics, Noun:**  _A function of which the **derivative** is a given function._
 
+<img width="783" height="531" alt="Screenshot 2026-05-07 at 09 55 16" src="https://github.com/user-attachments/assets/7b567aa2-544b-4402-9aeb-922f59dd4a40" />
+
+
 # WARNING: SLOP BELOW
 ## Architecture
 
