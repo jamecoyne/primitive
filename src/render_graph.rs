@@ -291,8 +291,20 @@ impl Node for GlslNode {
 
 #[derive(Debug, Deserialize)]
 pub struct GraphConfig {
+    /// Top-level `[out]` block — declares which node's output is rendered
+    /// to the swapchain. Required.
+    pub out: OutConfig,
     #[serde(rename = "node", default)]
     pub nodes: Vec<NodeConfig>,
+}
+
+/// Top-level `[out]` table. Currently a single field; kept as a struct
+/// so future fields (e.g. tone mapping, color space, blend mode) can land
+/// without breaking the TOML schema.
+#[derive(Debug, Deserialize)]
+pub struct OutConfig {
+    /// Id of the node whose output gets blitted to the swapchain.
+    pub input: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -307,8 +319,6 @@ pub struct NodeConfig {
     pub frag: Option<String>,
     #[serde(default)]
     pub inputs: Vec<String>,
-    #[serde(default)]
-    pub present: bool,
 }
 
 /// Parse a TOML graph definition. Returns a structured error on bad input
@@ -507,8 +517,8 @@ pub enum GraphError {
     /// GLSL source. Names which one is missing.
     MissingShaderStage { id: String, stage: &'static str },
     DuplicateNodeId { id: String },
-    MissingPresentNode,
-    MultiplePresentNodes,
+    /// `[out].input` references a node id that wasn't declared.
+    UnknownOutInput { input: String },
     /// The named upstream id wasn't declared in the config.
     UnknownInput { node: String, input: String },
     /// The graph contains a cycle that includes the named node.
@@ -531,8 +541,9 @@ impl std::fmt::Display for GraphError {
             GraphError::DuplicateNodeId { id } => {
                 write!(f, "two or more nodes share id {id:?}")
             }
-            GraphError::MissingPresentNode => write!(f, "no node has `present = true`"),
-            GraphError::MultiplePresentNodes => write!(f, "more than one node has `present = true`"),
+            GraphError::UnknownOutInput { input } => {
+                write!(f, "[out].input references unknown node {input:?}")
+            }
             GraphError::UnknownInput { node, input } => {
                 write!(f, "node {node:?} references unknown input {input:?}")
             }
@@ -595,19 +606,13 @@ impl RenderGraph {
             }
         }
 
-        // 2. Exactly one present node.
-        let present_indices: Vec<usize> = cfg
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| n.present)
-            .map(|(i, _)| i)
-            .collect();
-        let present_index = match present_indices.as_slice() {
-            [] => return Err(GraphError::MissingPresentNode),
-            [i] => *i,
-            _ => return Err(GraphError::MultiplePresentNodes),
-        };
+        // 2. Resolve `[out].input` to the index of the node whose output
+        //    gets blitted to the swapchain.
+        let present_index = *id_to_idx
+            .get(cfg.out.input.as_str())
+            .ok_or_else(|| GraphError::UnknownOutInput {
+                input: cfg.out.input.clone(),
+            })?;
 
         // 3. Resolve inputs into upstream indices.
         let mut input_indices: Vec<Vec<usize>> = Vec::with_capacity(cfg.nodes.len());

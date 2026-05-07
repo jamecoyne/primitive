@@ -3,6 +3,11 @@
 # escape gymnastics for the shader code). The Rust side reads the strings
 # and feeds them to wgpu/naga at startup; no separate shader files.
 #
+# Top-level `[out]` table — declares which node's output is rendered to
+# the swapchain. `out.input` is the id of the displayed node. Other nodes
+# still execute every frame even if they're not ancestors of `out` (their
+# outputs become side-effect intermediate textures).
+#
 # Schema (per [[node]] entry):
 #   id        : unique string identifier
 #   kind      : node type — currently only "glsl" is implemented
@@ -16,16 +21,15 @@
 #               The graph topologically sorts by `inputs`, so the order in
 #               this file doesn't matter — declare nodes wherever it reads
 #               most clearly.
-#   present   : if true, this node renders to the swapchain (surface) view
-#               instead of an intermediate texture; exactly one node must
-#               have `present = true`.
+
+[out]
+input = "invert"
 
 # 1) Mandelbrot — generates the fractal into an intermediate texture.
 [[node]]
 id = "mandelbrot"
 kind = "glsl"
 inputs = []
-present = true
 
 vert = '''
 #version 450
@@ -104,7 +108,6 @@ void main() {
 id = "invert"
 kind = "glsl"
 inputs = ["mandelbrot"]
-present = false
 
 vert = '''
 #version 450
