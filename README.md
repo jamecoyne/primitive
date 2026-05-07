@@ -1,15 +1,21 @@
-# wgpuweb
+# PRIMITIVE
 
 [![Test](https://github.com/jamecoyne/primitive/actions/workflows/test.yml/badge.svg)](https://github.com/jamecoyne/primitive/actions/workflows/test.yml)
 [![Deploy to GitHub Pages](https://github.com/jamecoyne/primitive/actions/workflows/pages.yml/badge.svg)](https://github.com/jamecoyne/primitive/actions/workflows/pages.yml)
 
-Proof-of-concept Rust + [wgpu](https://wgpu.rs) app that renders the Mandelbrot
-set with a GLSL fragment shader and runs from the same source on **native
-macOS** and **the browser** (compiled to WebAssembly via `wasm-bindgen`). The
-mandelbrot's center tracks the cursor.
+### ABOUT
+Primative is my experiment with trying to create a rust baseed real time video graph engine, with the goal of building a reliable, user friendly, and open source frieldly cross platform environment for live code and creative tech. 
+[It's deployed on github pages! Check it out!](https://jamecoyne.github.io/primitive/)
 
-![mandelbrot screenshot](tests/baseline.png)
+### DEFINITION
 
+**Primative, Adjective:**  _Unaffected or little affected by civilizing influences; uncivilized. Simple; unsophisticated._
+
+**Primative, Fine arts, Noun:**  _A naive or unschooled artist.  An artist belonging to the early stage in the development of a style._
+
+**Primative, Mathematics, Noun:**  _A function of which the **derivative** is a given function._
+
+# WARNING: SLOP BELOW
 ## Architecture
 
 - Single crate (`src/lib.rs` is shared; `src/main.rs` is the native entry,
