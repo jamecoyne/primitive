@@ -1,22 +1,181 @@
-# Render-graph definition. Loaded at compile time via include_str! so the
-# binary stays self-contained on both native and wasm.
+# Render-graph definition. Self-contained: GLSL source for every node lives
+# in this file directly (multi-line literal strings — `'''…'''` — so no
+# escape gymnastics for the shader code). The Rust side reads the strings
+# and feeds them to wgpu/naga at startup; no separate shader files.
+#
+# Top-level `[out]` table — declares which node's output is rendered to
+# the swapchain. `out.input` is the id of the displayed node. Other nodes
+# still execute every frame even if they're not ancestors of `out` (their
+# outputs become side-effect intermediate textures).
 #
 # Schema (per [[node]] entry):
 #   id        : unique string identifier
 #   kind      : node type — currently only "glsl" is implemented
-#   shader    : (kind = "glsl") the basename of a `<name>.vert` + `<name>.frag`
-#               pair under `shaders/`. The build script auto-discovers every
-#               such pair; just drop a new shader in and reference it here.
+#   vert      : (kind = "glsl") full GLSL source for the vertex stage
+#   frag      : (kind = "glsl") full GLSL source for the fragment stage
 #   inputs    : array of upstream node ids whose outputs feed this node.
-#               Must be empty until the chaining/intermediate-texture path
-#               lands; the graph builder rejects non-empty `inputs` today.
-#   present   : if true, this node renders to the swapchain (surface) view
-#               instead of an intermediate texture; exactly one node must
-#               have `present = true`.
+#               In the fragment shader the bindings are:
+#                   set=0, binding=0  : Uniforms (resolution, mouse, time)
+#                   set=0, binding=1  : sampler (when inputs is non-empty)
+#                   set=0, binding=2..2+N : input texture i
+#               The graph topologically sorts by `inputs`, so the order in
+#               this file doesn't matter — declare nodes wherever it reads
+#               most clearly.
+#   viewer    : optional inline table { enabled, resolution, position }.
+#               When `enabled = true`, the node's full intermediate is
+#               downsampled every frame into a thumbnail-sized texture
+#               (default 128 × 96) and overlaid as a PiP at the
+#               configured pixel offset. `position = [x, y]` is the
+#               thumbnail's top-left in physical pixels from the
+#               canvas's top-left (default `[16, 16]`). Multiple viewers
+#               with the same offset overlap; thumbnails that would
+#               extend past the canvas are silently skipped that frame.
+#               Inspired by TouchDesigner's per-operator viewer toggle.
+#               Example:
+#                 viewer = { enabled = true, resolution = [256, 192], position = [400, 16] }
 
+[out]
+input = "out"
+
+# 1) Mandelbrot — generates the fractal into an intermediate texture.
+#    Viewer enabled so a preview UI can sample the un-inverted output.
 [[node]]
 id = "mandelbrot"
 kind = "glsl"
-shader = "mandelbrot"
 inputs = []
-present = true
+viewer = { enabled = true, resolution = [256, 192], position = [16, 16] }
+
+vert = '''
+#version 450
+
+// Fullscreen triangle — a single 3-vertex triangle that covers the
+// viewport. Avoids the need for a vertex buffer entirely.
+layout(location = 0) out vec2 v_uv;
+
+void main() {
+    vec2 pos = vec2(
+        float((gl_VertexIndex & 1) * 4) - 1.0,
+        float((gl_VertexIndex & 2) * 2) - 1.0
+    );
+    v_uv = pos * 0.5 + 0.5;
+    gl_Position = vec4(pos, 0.0, 1.0);
+}
+'''
+
+frag = '''
+#version 450
+
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 o_color;
+
+layout(set = 0, binding = 0) uniform Uniforms {
+    vec2 resolution;
+    vec2 mouse;     // pixel coords, top-left origin (winit y-down)
+    float time;
+    float _pad0;
+    float _pad1;
+    float _pad2;
+} u;
+
+void main() {
+    float aspect = u.resolution.x / u.resolution.y;
+
+    // Screen-space NDC of this fragment ([-aspect, +aspect] × [-1, +1]).
+    vec2 ndc = v_uv * 2.0 - 1.0;
+    ndc.x *= aspect;
+
+    // Mouse → NDC. winit y is top-down, NDC y is bottom-up, so flip.
+    vec2 m_uv = u.mouse / u.resolution;
+    vec2 m_ndc = vec2(m_uv.x * 2.0 - 1.0, 1.0 - m_uv.y * 2.0);
+    m_ndc.x *= aspect;
+
+    float zoom = 1.6 + 0.6 * sin(u.time * 0.15);
+    vec2 fractal_origin = vec2(-0.745, 0.10);
+    // Subtracting m_ndc translates the mandelbrot so its center sits under the cursor.
+    vec2 c = fractal_origin + (ndc - m_ndc) * zoom;
+
+    vec2 z = vec2(0.0);
+    const int MAX_ITER = 384;
+    int i = 0;
+    for (; i < MAX_ITER; ++i) {
+        if (dot(z, z) > 256.0) break;
+        z = vec2(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + c;
+    }
+
+    if (i >= MAX_ITER) {
+        o_color = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+
+    float log_zn = log(dot(z, z)) * 0.5;
+    float nu = log(log_zn / log(2.0)) / log(2.0);
+    float smooth_i = float(i) + 1.0 - nu;
+    float t = smooth_i / float(MAX_ITER);
+
+    vec3 col = 0.5 + 0.5 * cos(6.28318 * (t + vec3(0.0, 0.33, 0.67)) + u.time * 0.4);
+    o_color = vec4(col, 1.0);
+}
+'''
+
+# 2) Invert — color-inverts the previous pass and writes to the swapchain.
+#    Viewer enabled at a non-corner pixel offset to demonstrate the
+#    per-node positioning.
+[[node]]
+id = "invert"
+kind = "glsl"
+inputs = ["mandelbrot"]
+viewer = { enabled = true, resolution = [256, 192], position = [320, 16] }
+
+vert = '''
+#version 450
+
+layout(location = 0) out vec2 v_uv;
+
+void main() {
+    vec2 pos = vec2(
+        float((gl_VertexIndex & 1) * 4) - 1.0,
+        float((gl_VertexIndex & 2) * 2) - 1.0
+    );
+    v_uv = pos * 0.5 + 0.5;
+    gl_Position = vec4(pos, 0.0, 1.0);
+}
+'''
+
+frag = '''
+#version 450
+
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 o_color;
+
+layout(set = 0, binding = 0) uniform Uniforms {
+    vec2 resolution;
+    vec2 mouse;
+    float time;
+    float _pad0;
+    float _pad1;
+    float _pad2;
+} u;
+
+layout(set = 0, binding = 1) uniform sampler   s_in;
+layout(set = 0, binding = 2) uniform texture2D t_input0;
+
+void main() {
+    // Texture coords have y=0 at the top of the image; v_uv from the
+    // fullscreen-triangle vert shader has y=0 at the BOTTOM of the
+    // viewport. Flip y so we sample the upstream pass without inverting
+    // the image vertically.
+    vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+    vec4 c = texture(sampler2D(t_input0, s_in), uv);
+    o_color = vec4(1.0 - c.rgb, c.a);
+}
+'''
+
+# 3) Out — passthrough sink that the swapchain reads from. Lives in the
+#    network like any other node so its viewer thumbnail shows the final
+#    output of the graph. Wired to `invert` by default; reroute by
+#    drag-connecting a different node's output to its input port.
+[[node]]
+id = "out"
+kind = "out"
+inputs = ["invert"]
+viewer = { enabled = true, resolution = [256, 192], position = [624, 16] }

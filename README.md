@@ -102,9 +102,9 @@ Cargo.toml
 src/
   lib.rs             # shared app + State + ApplicationHandler
   main.rs            # native entry
-shaders/
-  mandelbrot.vert    # fullscreen triangle
-  mandelbrot.frag    # iterated z² + c with smooth coloring
+  render_graph.rs    # Node trait + GlslNode + RenderGraph (TOML-loaded)
+config/
+  graph.toml         # graph definition incl. inline GLSL source per node
 web/
   index.html         # canvas + module loader (carried into web/dist by build-web.sh)
 build-web.sh         # wasm32 → web/dist/ with version-matched wasm-bindgen-cli
