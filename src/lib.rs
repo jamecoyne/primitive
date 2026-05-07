@@ -12,7 +12,7 @@ use wasm_bindgen::prelude::*;
 pub mod hud;
 pub mod render_graph;
 use hud::Hud;
-use render_graph::{NodeContext, RenderGraph, DEFAULT_GRAPH_TOML};
+use render_graph::{NodeContext, RenderGraph, ViewerRegion, DEFAULT_GRAPH_TOML};
 
 /// Test-mode overrides parsed from URL params on web. None on native.
 /// When `time` is Some, the time uniform is frozen at that value. When
@@ -522,16 +522,25 @@ impl ApplicationHandler<UserEvent> for App {
                 match button_state {
                     ElementState::Pressed => {
                         let cu = [state.cursor_pos[0] as u32, state.cursor_pos[1] as u32];
-                        if let Some(idx) = state.graph.hit_test_viewer(cu) {
-                            if let Some([rx, ry, _, _]) = state.graph.viewer_rect(idx) {
-                                state.dragging = Some(DragState {
-                                    viewer_index: idx,
-                                    grab_offset: [
-                                        state.cursor_pos[0] - rx as f32,
-                                        state.cursor_pos[1] - ry as f32,
-                                    ],
-                                });
+                        match state.graph.hit_test_viewer_region(cu) {
+                            Some((idx, ViewerRegion::Eye)) => {
+                                // Toggle the per-viewer preview. Don't
+                                // start a drag; the user is interacting
+                                // with the icon, not the thumbnail body.
+                                let _ = state.graph.toggle_viewer_preview(idx);
                             }
+                            Some((idx, ViewerRegion::Body)) => {
+                                if let Some([rx, ry, _, _]) = state.graph.viewer_rect(idx) {
+                                    state.dragging = Some(DragState {
+                                        viewer_index: idx,
+                                        grab_offset: [
+                                            state.cursor_pos[0] - rx as f32,
+                                            state.cursor_pos[1] - ry as f32,
+                                        ],
+                                    });
+                                }
+                            }
+                            None => {}
                         }
                     }
                     ElementState::Released => {

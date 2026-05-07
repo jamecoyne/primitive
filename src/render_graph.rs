@@ -637,22 +637,17 @@ void main() {
 }
 ";
 
-const SOLID_FILL_FRAG: &str = "#version 450
-layout(location = 0) out vec4 o_color;
-void main() {
-    // Near-black with a slight cool tint — readable border around any
-    // thumbnail content (the magenta source and the inverted thumbnail
-    // both have light-coloured surrounds, so a dark border stands out).
-    o_color = vec4(0.07, 0.07, 0.09, 1.0);
-}
-";
-
 struct SolidFill {
     pipeline: wgpu::RenderPipeline,
 }
 
 impl SolidFill {
-    fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat, label: &str) -> Self {
+    fn new(
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        color: [f32; 4],
+        label: &str,
+    ) -> Self {
         let vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(&format!("{label}.vert")),
             source: wgpu::ShaderSource::Glsl {
@@ -661,10 +656,14 @@ impl SolidFill {
                 defines: Default::default(),
             },
         });
+        let frag_src = format!(
+            "#version 450\nlayout(location = 0) out vec4 o_color;\nvoid main() {{ o_color = vec4({}, {}, {}, {}); }}\n",
+            color[0], color[1], color[2], color[3],
+        );
         let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(&format!("{label}.frag")),
             source: wgpu::ShaderSource::Glsl {
-                shader: SOLID_FILL_FRAG.into(),
+                shader: frag_src.into(),
                 stage: wgpu::naga::ShaderStage::Fragment,
                 defines: Default::default(),
             },
@@ -707,6 +706,141 @@ impl SolidFill {
 
     /// Fill `viewport` with the constant fragment color. Uses
     /// `LoadOp::Load` so pixels outside the viewport are preserved.
+    fn record_overlay(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        viewport: [f32; 4],
+        label: &str,
+        ts_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: ts_writes,
+        });
+        pass.set_viewport(viewport[0], viewport[1], viewport[2], viewport[3], 0.0, 1.0);
+        pass.set_pipeline(&self.pipeline);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EyeOverlay — procedurally drawn eye icon overlaid on the top-left of
+// each viewer thumbnail. Click on this region toggles the viewer's
+// preview on/off. No bind groups; the fragment shader signed-distance
+// fields the almond + iris from `v_uv`. Alpha-blended so the corners
+// of the icon's bounding box don't paint over the thumbnail's border.
+// ---------------------------------------------------------------------------
+
+const EYE_VERT: &str = "#version 450
+layout(location = 0) out vec2 v_uv;
+void main() {
+    vec2 pos = vec2(
+        float((gl_VertexIndex & 1) * 4) - 1.0,
+        float((gl_VertexIndex & 2) * 2) - 1.0
+    );
+    v_uv = pos * 0.5 + 0.5;
+    gl_Position = vec4(pos, 0.0, 1.0);
+}
+";
+
+const EYE_FRAG: &str = "#version 450
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 o_color;
+void main() {
+    // Centre the UV at (0, 0) in [-1, 1].
+    vec2 p = v_uv * 2.0 - 1.0;
+    // Wide almond: x²/1 + y²/0.25 < 1 ⇒ wide ellipse with the iris
+    // sitting comfortably inside.
+    float almond = p.x * p.x + (p.y * p.y) * 4.0;
+    float iris   = length(p);
+    if (almond > 1.0) {
+        // Outside the eye almond — transparent so the thumbnail shows.
+        o_color = vec4(0.0);
+    } else if (iris < 0.32) {
+        // Pupil/iris.
+        o_color = vec4(0.05, 0.05, 0.07, 1.0);
+    } else if (almond > 0.78) {
+        // Eyelid outline.
+        o_color = vec4(0.05, 0.05, 0.07, 1.0);
+    } else {
+        // Sclera.
+        o_color = vec4(0.96, 0.96, 0.98, 1.0);
+    }
+}
+";
+
+struct EyeOverlay {
+    pipeline: wgpu::RenderPipeline,
+}
+
+impl EyeOverlay {
+    fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat, label: &str) -> Self {
+        let vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(&format!("{label}.vert")),
+            source: wgpu::ShaderSource::Glsl {
+                shader: EYE_VERT.into(),
+                stage: wgpu::naga::ShaderStage::Vertex,
+                defines: Default::default(),
+            },
+        });
+        let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(&format!("{label}.frag")),
+            source: wgpu::ShaderSource::Glsl {
+                shader: EYE_FRAG.into(),
+                stage: wgpu::naga::ShaderStage::Fragment,
+                defines: Default::default(),
+            },
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("{label}:pipeline-layout")),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&format!("{label}:pipeline")),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &vs,
+                entry_point: Some("main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fs,
+                entry_point: Some("main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    // Alpha blend so the transparent corner pixels of
+                    // the icon's bounding viewport leave the underlying
+                    // thumbnail content visible.
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        Self { pipeline }
+    }
+
     fn record_overlay(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -826,22 +960,50 @@ pub struct RenderGraph {
     /// Solid-color fill used for the thick border drawn behind each
     /// viewer thumbnail. Targets `present_format`.
     border_fill: SolidFill,
+    /// Mid-gray fill drawn in place of the thumbnail content when a
+    /// node's runtime preview has been toggled off via the eye icon.
+    disabled_fill: SolidFill,
+    /// Procedural eye icon overlaid on the top-left of each thumbnail.
+    /// Click hit-testing in this rect toggles the per-node preview.
+    eye_overlay: EyeOverlay,
+    /// Per-node runtime flag: `true` (default) renders the live
+    /// downsampled thumbnail, `false` renders the gray placeholder.
+    /// Toggled by `toggle_viewer_preview` from a click on the eye icon.
+    /// Parallel to `nodes`/`viewers`.
+    viewer_preview_on: Vec<bool>,
     /// Optional GPU timestamps. `None` when the device didn't expose
     /// `Features::TIMESTAMP_QUERY` (web fallback, older drivers).
     /// Enabled by `enable_perf_monitor` after build.
     perf: Option<PerfMonitor>,
     /// Pre-built per-pass labels so `next_writes` doesn't re-`format!`
-    /// every frame. One per node for each of the four pass sites.
+    /// every frame. One per node for each pass site.
     schedule_labels: Vec<String>,
     viewer_downsample_labels: Vec<String>,
     viewer_border_labels: Vec<String>,
     viewer_pip_labels: Vec<String>,
+    viewer_disabled_labels: Vec<String>,
+    viewer_eye_labels: Vec<String>,
     width: u32,
     height: u32,
 }
 
 /// Pixel thickness of the border drawn around each viewer thumbnail.
 const VIEWER_BORDER_PX: u32 = 6;
+/// Side length of the eye icon (a square anchored top-left of each
+/// thumbnail). The eye is also the click hit-region for toggling the
+/// preview.
+const VIEWER_EYE_PX: u32 = 22;
+/// Inset of the eye icon from the thumbnail's top-left corner.
+const VIEWER_EYE_INSET_PX: u32 = 6;
+
+/// Region within a viewer thumbnail returned by `hit_test_viewer_region`.
+/// Lets the caller decide whether a click should toggle the preview
+/// (Eye) or start a drag (Body).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewerRegion {
+    Eye,
+    Body,
+}
 
 /// Per-node viewer state — a thumbnail-sized texture filled every frame
 /// by downsampling the node's full intermediate. Two bind groups because
@@ -1016,7 +1178,24 @@ impl RenderGraph {
             cfg.nodes.iter().map(|n| n.viewer.clone()).collect();
         let present_blit = Blitter::new(device, present_format, "present-blit");
         let viewer_blit = Blitter::new(device, INTERMEDIATE_FORMAT, "viewer-blit");
-        let border_fill = SolidFill::new(device, present_format, "viewer-border");
+        // Near-black with a slight cool tint — readable border ring
+        // around any thumbnail content (the magenta source and the
+        // inverted thumbnail both have light-coloured surrounds).
+        let border_fill = SolidFill::new(
+            device,
+            present_format,
+            [0.07, 0.07, 0.09, 1.0],
+            "viewer-border",
+        );
+        // Mid-gray for the disabled-preview placeholder. Distinct from
+        // the dark border but still neutral against the canvas content.
+        let disabled_fill = SolidFill::new(
+            device,
+            present_format,
+            [0.45, 0.45, 0.48, 1.0],
+            "viewer-disabled",
+        );
+        let eye_overlay = EyeOverlay::new(device, present_format, "viewer-eye");
 
         log::info!(
             "render graph built: {} node(s), schedule = {:?}, present = {:?}, viewers = {:?}",
@@ -1052,6 +1231,15 @@ impl RenderGraph {
             .iter()
             .map(|e| format!("viewer-pip:{}", e.id))
             .collect();
+        let viewer_disabled_labels = nodes
+            .iter()
+            .map(|e| format!("viewer-disabled:{}", e.id))
+            .collect();
+        let viewer_eye_labels = nodes
+            .iter()
+            .map(|e| format!("viewer-eye:{}", e.id))
+            .collect();
+        let viewer_preview_on = vec![true; nodes.len()];
 
         Ok(Self {
             nodes,
@@ -1064,11 +1252,16 @@ impl RenderGraph {
             present_bind_group: None,
             viewer_blit,
             border_fill,
+            disabled_fill,
+            eye_overlay,
+            viewer_preview_on,
             perf: None,
             schedule_labels,
             viewer_downsample_labels,
             viewer_border_labels,
             viewer_pip_labels,
+            viewer_disabled_labels,
+            viewer_eye_labels,
             width: 0,
             height: 0,
         })
@@ -1261,9 +1454,14 @@ impl RenderGraph {
 
         // Viewer downsamples — independent of present, can run in any
         // order relative to it. Must precede the PiP overlays below since
-        // those sample the textures these passes write.
+        // those sample the textures these passes write. Skip the
+        // downsample when the runtime preview is off — the thumbnail
+        // texture won't be sampled this frame so there's nothing to do.
         for i in 0..self.viewers.len() {
             let Some(v) = &self.viewers[i] else { continue };
+            if !self.viewer_preview_on[i] {
+                continue;
+            }
             let label = format!("{}:viewer:downsample-pass", self.nodes[i].id);
             let writes = self
                 .perf
@@ -1323,21 +1521,65 @@ impl RenderGraph {
             );
             passes += 1;
 
-            // Thumbnail blit on top.
-            let label = format!("{}:viewer:pip-pass", self.nodes[i].id);
-            let writes = self
-                .perf
-                .as_mut()
-                .and_then(|p| p.next_writes(&self.viewer_pip_labels[i]));
-            self.present_blit.record_overlay(
-                ctx.encoder,
-                &v.pip_bg,
-                ctx.output,
-                [x as f32, y as f32, v.width as f32, v.height as f32],
-                &label,
-                writes,
-            );
+            let preview_on = self.viewer_preview_on[i];
+            if preview_on {
+                // Live thumbnail.
+                let label = format!("{}:viewer:pip-pass", self.nodes[i].id);
+                let writes = self
+                    .perf
+                    .as_mut()
+                    .and_then(|p| p.next_writes(&self.viewer_pip_labels[i]));
+                self.present_blit.record_overlay(
+                    ctx.encoder,
+                    &v.pip_bg,
+                    ctx.output,
+                    [x as f32, y as f32, v.width as f32, v.height as f32],
+                    &label,
+                    writes,
+                );
+            } else {
+                // Gray placeholder — no live content for this node.
+                let label = format!("{}:viewer:disabled-pass", self.nodes[i].id);
+                let writes = self
+                    .perf
+                    .as_mut()
+                    .and_then(|p| p.next_writes(&self.viewer_disabled_labels[i]));
+                self.disabled_fill.record_overlay(
+                    ctx.encoder,
+                    ctx.output,
+                    [x as f32, y as f32, v.width as f32, v.height as f32],
+                    &label,
+                    writes,
+                );
+            }
             passes += 1;
+
+            // Eye-icon overlay anchored top-left of the thumbnail. Always
+            // rendered (whether preview is on or off) so the user can
+            // click it to flip the state.
+            let ex = x + VIEWER_EYE_INSET_PX;
+            let ey = y + VIEWER_EYE_INSET_PX;
+            // Don't render the eye if it doesn't fit (e.g. tiny thumbnail).
+            if ex + VIEWER_EYE_PX <= ctx.width && ey + VIEWER_EYE_PX <= ctx.height {
+                let eye_label = format!("{}:viewer:eye-pass", self.nodes[i].id);
+                let eye_writes = self
+                    .perf
+                    .as_mut()
+                    .and_then(|p| p.next_writes(&self.viewer_eye_labels[i]));
+                self.eye_overlay.record_overlay(
+                    ctx.encoder,
+                    ctx.output,
+                    [
+                        ex as f32,
+                        ey as f32,
+                        VIEWER_EYE_PX as f32,
+                        VIEWER_EYE_PX as f32,
+                    ],
+                    &eye_label,
+                    eye_writes,
+                );
+                passes += 1;
+            }
         }
 
         // Resolve query set + copy into a readback buffer (no-op when the
@@ -1459,6 +1701,35 @@ impl RenderGraph {
             }
         }
         None
+    }
+
+    /// Like `hit_test_viewer` but distinguishes whether the cursor lands
+    /// on the eye-icon corner (toggle preview) or the rest of the
+    /// thumbnail body (drag).
+    pub fn hit_test_viewer_region(&self, cursor: [u32; 2]) -> Option<(usize, ViewerRegion)> {
+        let i = self.hit_test_viewer(cursor)?;
+        let [x, y, _, _] = self.viewer_rect(i)?;
+        let ex = x + VIEWER_EYE_INSET_PX;
+        let ey = y + VIEWER_EYE_INSET_PX;
+        let region = if cursor[0] >= ex
+            && cursor[0] < ex + VIEWER_EYE_PX
+            && cursor[1] >= ey
+            && cursor[1] < ey + VIEWER_EYE_PX
+        {
+            ViewerRegion::Eye
+        } else {
+            ViewerRegion::Body
+        };
+        Some((i, region))
+    }
+
+    /// Flip a viewer's runtime preview on/off. When off, the thumbnail
+    /// shows a gray placeholder instead of the live downsampled content.
+    /// Returns the new state, or `None` if `idx` is out of range.
+    pub fn toggle_viewer_preview(&mut self, idx: usize) -> Option<bool> {
+        let slot = self.viewer_preview_on.get_mut(idx)?;
+        *slot = !*slot;
+        Some(*slot)
     }
 
     /// Returns a slot for every node where `viewer.enabled = true`. The
