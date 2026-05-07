@@ -21,12 +21,17 @@
 #               The graph topologically sorts by `inputs`, so the order in
 #               this file doesn't matter — declare nodes wherever it reads
 #               most clearly.
-#   viewer    : optional inline table { enabled, resolution }. When
-#               `enabled = true`, the node's full intermediate is
+#   viewer    : optional inline table { enabled, resolution, position }.
+#               When `enabled = true`, the node's full intermediate is
 #               downsampled every frame into a thumbnail-sized texture
-#               (default 128 × 96) for a developer-facing preview UI.
-#               Inspired by TouchDesigner's per-operator viewer toggle.
-#               Example: `viewer = { enabled = true, resolution = [256, 192] }`
+#               (default 128 × 96) and overlaid as a PiP at the named
+#               corner (`"top-left"` (default), `"top-right"`,
+#               `"bottom-left"`, `"bottom-right"`). Multiple viewers in
+#               the same corner stack: top corners stack downward, bottom
+#               corners stack upward. Inspired by TouchDesigner's
+#               per-operator viewer toggle.
+#               Example:
+#                 viewer = { enabled = true, resolution = [256, 192], position = "top-right" }
 
 [out]
 input = "invert"
@@ -37,7 +42,7 @@ input = "invert"
 id = "mandelbrot"
 kind = "glsl"
 inputs = []
-viewer = { enabled = true, resolution = [256, 192] }
+viewer = { enabled = true, resolution = [256, 192], position = "top-left" }
 
 vert = '''
 #version 450
@@ -112,10 +117,12 @@ void main() {
 '''
 
 # 2) Invert — color-inverts the previous pass and writes to the swapchain.
+#    Viewer enabled at top-right to demonstrate per-node positioning.
 [[node]]
 id = "invert"
 kind = "glsl"
 inputs = ["mandelbrot"]
+viewer = { enabled = true, resolution = [256, 192], position = "top-right" }
 
 vert = '''
 #version 450

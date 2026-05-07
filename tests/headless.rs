@@ -157,7 +157,8 @@ fn viewer_textures_match_config() {
         graph.resize(&device, 1024, 800);
 
         let viewers = graph.viewer_textures();
-        // Default config has the mandelbrot viewer enabled at 256×192.
+        // Default config has both viewers enabled at 256×192 — mandelbrot
+        // anchored top-left, invert anchored top-right.
         let mandel = viewers
             .iter()
             .find(|v| v.node_id == "mandelbrot")
@@ -167,14 +168,10 @@ fn viewer_textures_match_config() {
             (256, 192),
             "mandelbrot viewer resolution should match `viewer.resolution` in graph.toml"
         );
-
-        // Anything else we declared `viewer.enabled = false` (or omitted)
-        // must NOT appear here.
-        for v in &viewers {
-            assert_ne!(
-                v.node_id, "invert",
-                "invert has no `viewer.enabled = true` so it shouldn't appear in viewer_textures"
-            );
-        }
+        let invert = viewers
+            .iter()
+            .find(|v| v.node_id == "invert")
+            .expect("invert viewer slot missing");
+        assert_eq!((invert.width, invert.height), (256, 192));
     });
 }

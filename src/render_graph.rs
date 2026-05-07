@@ -310,15 +310,15 @@ pub struct OutConfig {
 /// Per-node viewer settings. Modeled after TouchDesigner's per-operator
 /// "viewer active" toggle and viewer resolution: when `enabled`, the node's
 /// full intermediate is downsampled into a thumbnail-sized texture every
-/// frame so a developer-facing preview UI can sample it.
+/// frame and overlaid in the named corner of the swapchain (PiP).
 ///
 /// TOML form (inline table per node):
 ///
 /// ```toml
-/// viewer = { enabled = true, resolution = [128, 96] }
+/// viewer = { enabled = true, resolution = [128, 96], position = "top-right" }
 /// ```
 ///
-/// Both fields are optional; an absent `viewer` table defaults to
+/// All fields are optional; an absent `viewer` table defaults to
 /// `enabled = false`, in which case no viewer texture is allocated.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ViewerConfig {
@@ -326,6 +326,11 @@ pub struct ViewerConfig {
     pub enabled: bool,
     #[serde(default = "default_viewer_resolution")]
     pub resolution: [u32; 2],
+    /// Which corner of the swapchain the PiP thumbnail anchors to.
+    /// Multiple viewers in the same corner stack: top corners stack
+    /// downward, bottom corners stack upward.
+    #[serde(default)]
+    pub position: ViewerPosition,
 }
 
 impl Default for ViewerConfig {
@@ -333,12 +338,26 @@ impl Default for ViewerConfig {
         Self {
             enabled: false,
             resolution: default_viewer_resolution(),
+            position: ViewerPosition::default(),
         }
     }
 }
 
 fn default_viewer_resolution() -> [u32; 2] {
     [128, 96]
+}
+
+/// Corner anchor for a viewer's PiP overlay. Strings in TOML are
+/// kebab-case (`"top-left"`, `"top-right"`, `"bottom-left"`,
+/// `"bottom-right"`).
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ViewerPosition {
+    #[default]
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
 }
 
 #[derive(Debug, Deserialize)]
@@ -994,34 +1013,26 @@ impl RenderGraph {
         self.present_blit
             .record(ctx.encoder, present_bg, ctx.output, "present-blit:pass");
 
-        // PiP overlays — draw each viewer thumbnail in the top-left corner
-        // of the swapchain, stacked vertically with a 16-pixel margin.
-        // Skip silently when a thumbnail wouldn't fit so a tiny viewport
-        // doesn't blow up.
+        // PiP overlays — draw each viewer thumbnail at its configured
+        // corner. Multiple viewers in the same corner stack: top corners
+        // stack down, bottom corners stack up. Skip silently when a
+        // thumbnail wouldn't fit so a tiny viewport doesn't blow up.
         const MARGIN: u32 = 16;
-        let mut y = MARGIN;
+        let mut cursors = CornerCursors::new(ctx.width, ctx.height, MARGIN);
         for (i, viewer) in self.viewers.iter().enumerate() {
             let Some(v) = viewer else { continue };
-            if MARGIN + v.width > ctx.width {
+            let position = self.viewer_configs[i].position;
+            let Some((x, y)) = cursors.place(v.width, v.height, position) else {
                 continue;
-            }
-            if y + v.height + MARGIN > ctx.height {
-                break;
-            }
+            };
             let label = format!("{}:viewer:pip-pass", self.nodes[i].id);
             self.present_blit.record_overlay(
                 ctx.encoder,
                 &v.pip_bg,
                 ctx.output,
-                [
-                    MARGIN as f32,
-                    y as f32,
-                    v.width as f32,
-                    v.height as f32,
-                ],
+                [x as f32, y as f32, v.width as f32, v.height as f32],
                 &label,
             );
-            y += v.height + MARGIN;
         }
     }
 
@@ -1104,4 +1115,80 @@ fn topo_sort(
     }
 
     Ok(order)
+}
+
+/// Stacking layout for PiP viewer overlays. Each call to `place` returns
+/// the (x, y) top-left of the next thumbnail at the requested corner, or
+/// `None` when there isn't enough room left.
+struct CornerCursors {
+    margin: u32,
+    canvas_w: u32,
+    canvas_h: u32,
+    /// Top-of-next-thumbnail cursor for the two top corners. Starts at
+    /// `margin` and grows downward as thumbnails are placed.
+    tl_top: u32,
+    tr_top: u32,
+    /// Bottom-of-next-thumbnail cursor for the two bottom corners. Starts
+    /// at `canvas_h - margin` and shrinks upward as thumbnails are placed.
+    bl_bottom: u32,
+    br_bottom: u32,
+}
+
+impl CornerCursors {
+    fn new(canvas_w: u32, canvas_h: u32, margin: u32) -> Self {
+        let bottom = canvas_h.saturating_sub(margin);
+        Self {
+            margin,
+            canvas_w,
+            canvas_h,
+            tl_top: margin,
+            tr_top: margin,
+            bl_bottom: bottom,
+            br_bottom: bottom,
+        }
+    }
+
+    fn place(&mut self, w: u32, h: u32, position: ViewerPosition) -> Option<(u32, u32)> {
+        let m = self.margin;
+        // Width bound — thumbnail + two margins must fit horizontally.
+        if w + m * 2 > self.canvas_w {
+            return None;
+        }
+        match position {
+            ViewerPosition::TopLeft => {
+                let y = self.tl_top;
+                if y + h + m > self.canvas_h {
+                    return None;
+                }
+                self.tl_top = y + h + m;
+                Some((m, y))
+            }
+            ViewerPosition::TopRight => {
+                let y = self.tr_top;
+                if y + h + m > self.canvas_h {
+                    return None;
+                }
+                self.tr_top = y + h + m;
+                let x = self.canvas_w - m - w;
+                Some((x, y))
+            }
+            ViewerPosition::BottomLeft => {
+                if self.bl_bottom < h + m {
+                    return None;
+                }
+                let y = self.bl_bottom - h;
+                self.bl_bottom = y.saturating_sub(m);
+                Some((m, y))
+            }
+            ViewerPosition::BottomRight => {
+                if self.br_bottom < h + m {
+                    return None;
+                }
+                let y = self.br_bottom - h;
+                self.br_bottom = y.saturating_sub(m);
+                let x = self.canvas_w - m - w;
+                Some((x, y))
+            }
+        }
+    }
 }
