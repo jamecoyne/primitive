@@ -24,14 +24,15 @@
 #   viewer    : optional inline table { enabled, resolution, position }.
 #               When `enabled = true`, the node's full intermediate is
 #               downsampled every frame into a thumbnail-sized texture
-#               (default 128 × 96) and overlaid as a PiP at the named
-#               corner (`"top-left"` (default), `"top-right"`,
-#               `"bottom-left"`, `"bottom-right"`). Multiple viewers in
-#               the same corner stack: top corners stack downward, bottom
-#               corners stack upward. Inspired by TouchDesigner's
-#               per-operator viewer toggle.
+#               (default 128 × 96) and overlaid as a PiP at the
+#               configured pixel offset. `position = [x, y]` is the
+#               thumbnail's top-left in physical pixels from the
+#               canvas's top-left (default `[16, 16]`). Multiple viewers
+#               with the same offset overlap; thumbnails that would
+#               extend past the canvas are silently skipped that frame.
+#               Inspired by TouchDesigner's per-operator viewer toggle.
 #               Example:
-#                 viewer = { enabled = true, resolution = [256, 192], position = "top-right" }
+#                 viewer = { enabled = true, resolution = [256, 192], position = [400, 16] }
 
 [out]
 input = "invert"
@@ -42,7 +43,7 @@ input = "invert"
 id = "mandelbrot"
 kind = "glsl"
 inputs = []
-viewer = { enabled = true, resolution = [256, 192], position = "top-left" }
+viewer = { enabled = true, resolution = [256, 192], position = [16, 16] }
 
 vert = '''
 #version 450
@@ -117,12 +118,13 @@ void main() {
 '''
 
 # 2) Invert — color-inverts the previous pass and writes to the swapchain.
-#    Viewer enabled at top-right to demonstrate per-node positioning.
+#    Viewer enabled at a non-corner pixel offset to demonstrate the
+#    per-node positioning.
 [[node]]
 id = "invert"
 kind = "glsl"
 inputs = ["mandelbrot"]
-viewer = { enabled = true, resolution = [256, 192], position = "top-right" }
+viewer = { enabled = true, resolution = [256, 192], position = [320, 16] }
 
 vert = '''
 #version 450
