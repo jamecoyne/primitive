@@ -324,11 +324,180 @@ pub const DEFAULT_GRAPH_TOML: &str = include_str!("../config/graph.toml");
 // Graph — chaining, intermediates, topological execute
 // ---------------------------------------------------------------------------
 
-/// Format used for every intermediate (non-present) texture. Keeping it the
-/// same as the present format means cross-platform parity at the swapchain
-/// boundary still holds: linear shader output is sRGB-encoded once on
-/// every render-pass write.
+/// Format used for every intermediate texture. Same sRGB encoding on
+/// every render-pass write keeps cross-platform parity at the swapchain
+/// boundary: sampling the intermediate decodes back to linear, writing
+/// to the swapchain re-encodes — round-trip is exact at 8-bit precision.
 const INTERMEDIATE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+// ---------------------------------------------------------------------------
+// PresentBlit — internal final pass, copies the present node's intermediate
+// to the swapchain. Lets any node be both consumed and "presented".
+// ---------------------------------------------------------------------------
+
+const BLIT_VERT: &str = "#version 450
+layout(location = 0) out vec2 v_uv;
+void main() {
+    vec2 pos = vec2(
+        float((gl_VertexIndex & 1) * 4) - 1.0,
+        float((gl_VertexIndex & 2) * 2) - 1.0
+    );
+    v_uv = pos * 0.5 + 0.5;
+    gl_Position = vec4(pos, 0.0, 1.0);
+}
+";
+
+const BLIT_FRAG: &str = "#version 450
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 o_color;
+layout(set = 0, binding = 0) uniform sampler   s_in;
+layout(set = 0, binding = 1) uniform texture2D t_in;
+void main() {
+    // Texture y=0 is the top of the image; v_uv y=0 is the bottom of the
+    // viewport. Flip y so the presented frame stays upright.
+    vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+    o_color = texture(sampler2D(t_in, s_in), uv);
+}
+";
+
+struct PresentBlit {
+    pipeline: wgpu::RenderPipeline,
+    sampler: wgpu::Sampler,
+    bind_layout: wgpu::BindGroupLayout,
+    bind_group: Option<wgpu::BindGroup>,
+}
+
+impl PresentBlit {
+    fn new(device: &wgpu::Device, present_format: wgpu::TextureFormat) -> Self {
+        let vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit.vert"),
+            source: wgpu::ShaderSource::Glsl {
+                shader: BLIT_VERT.into(),
+                stage: wgpu::naga::ShaderStage::Vertex,
+                defines: Default::default(),
+            },
+        });
+        let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit.frag"),
+            source: wgpu::ShaderSource::Glsl {
+                shader: BLIT_FRAG.into(),
+                stage: wgpu::naga::ShaderStage::Fragment,
+                defines: Default::default(),
+            },
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("blit:sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blit:bind-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("blit:pipeline-layout"),
+            bind_group_layouts: &[&bind_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("blit:pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &vs,
+                entry_point: Some("main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fs,
+                entry_point: Some("main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: present_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        Self {
+            pipeline,
+            sampler,
+            bind_layout,
+            bind_group: None,
+        }
+    }
+
+    fn set_source(&mut self, device: &wgpu::Device, view: &wgpu::TextureView) {
+        self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit:bind-group"),
+            layout: &self.bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+            ],
+        }));
+    }
+
+    fn record(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
+        let bind_group = self
+            .bind_group
+            .as_ref()
+            .expect("PresentBlit bind_group not set — graph.resize must run before render");
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("blit:pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
 
 #[derive(Debug)]
 pub enum GraphError {
@@ -387,17 +556,17 @@ pub struct RenderGraph {
     nodes: Vec<NodeEntry>,
     /// Node indices in topological order: every node's `inputs` precede it.
     schedule: Vec<usize>,
-    /// Index in `nodes` of the unique node with `present = true`.
+    /// Index in `nodes` of the unique node with `present = true`. Its
+    /// intermediate is what `blit` copies to the swapchain.
     present_index: usize,
-    /// Format the present node renders into (the surface's view format).
-    /// Stored for completeness; intermediates use `INTERMEDIATE_FORMAT`.
-    #[allow(dead_code)]
-    present_format: wgpu::TextureFormat,
-    /// One slot per node, in the same order as `nodes`. The slot at
-    /// `present_index` stays `None`; every other slot holds the texture
-    /// the node renders into and downstream nodes sample from. Reallocated
-    /// on `resize`.
+    /// One slot per node, in the same order as `nodes`. Every node has
+    /// its own intermediate so any node can be both consumed by another
+    /// node and "presented". Reallocated on `resize`; `None` only before
+    /// the first `resize` call.
     intermediates: Vec<Option<Intermediate>>,
+    /// Internal final pass: copies `intermediates[present_index]` to the
+    /// caller-supplied swapchain view.
+    blit: PresentBlit,
     width: u32,
     height: u32,
 }
@@ -459,16 +628,13 @@ impl RenderGraph {
         // 4. Topological sort (DFS post-order with cycle detection).
         let schedule = topo_sort(&cfg.nodes, &input_indices)?;
 
-        // 5. Instantiate nodes.
+        // 5. Instantiate nodes. Every node — present or not — renders into
+        //    its own intermediate texture; an internal blit pass copies the
+        //    present node's intermediate to the swapchain at the end.
         let mut nodes: Vec<NodeEntry> = Vec::with_capacity(cfg.nodes.len());
         for (i, n) in cfg.nodes.iter().enumerate() {
-            // Present node renders into the surface format; everything else
-            // renders into INTERMEDIATE_FORMAT.
-            let format = if i == present_index {
-                present_format
-            } else {
-                INTERMEDIATE_FORMAT
-            };
+            let _ = i; // (no per-node format branch any more)
+            let format = INTERMEDIATE_FORMAT;
             let input_count = input_indices[i].len();
             let impl_: Box<dyn Node> = match n.kind.as_str() {
                 "glsl" => {
@@ -510,22 +676,24 @@ impl RenderGraph {
         }
 
         let intermediates = (0..nodes.len()).map(|_| None).collect();
+        let blit = PresentBlit::new(device, present_format);
 
         log::info!(
-            "render graph built: {} node(s), schedule = {:?}",
+            "render graph built: {} node(s), schedule = {:?}, present = {:?}",
             nodes.len(),
             schedule
                 .iter()
                 .map(|&i| nodes[i].id.as_str())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
+            nodes[present_index].id,
         );
 
         Ok(Self {
             nodes,
             schedule,
             present_index,
-            present_format,
             intermediates,
+            blit,
             width: 0,
             height: 0,
         })
@@ -541,21 +709,18 @@ impl RenderGraph {
         Self::build(device, present_format, &cfg)
     }
 
-    /// (Re)allocate intermediate textures and rebuild every node's bind
-    /// group. Call this once after `build` and again whenever the canvas
-    /// size changes.
+    /// (Re)allocate intermediate textures, rebuild every node's bind
+    /// group, and re-point the blit pass at the present node's view.
+    /// Call once after `build`, and again whenever the canvas size changes.
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         let width = width.max(1);
         let height = height.max(1);
         self.width = width;
         self.height = height;
 
-        // (Re)allocate intermediates for every non-present node.
+        // (Re)allocate an intermediate for every node — including the
+        // present node, since the blit pass samples it.
         for (i, entry) in self.nodes.iter().enumerate() {
-            if i == self.present_index {
-                self.intermediates[i] = None;
-                continue;
-            }
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(&format!("{}:intermediate", entry.id)),
                 size: wgpu::Extent3d {
@@ -574,8 +739,7 @@ impl RenderGraph {
             self.intermediates[i] = Some(Intermediate { texture, view });
         }
 
-        // Rebuild every bind group (textures changed; even no-input nodes
-        // need their initial bind group built).
+        // Rebuild every node's bind group with fresh upstream views.
         for i in 0..self.nodes.len() {
             let inputs = self.nodes[i].inputs.clone();
             let views: Vec<&wgpu::TextureView> = inputs
@@ -589,21 +753,24 @@ impl RenderGraph {
                 .collect();
             self.nodes[i].impl_.set_inputs(device, &views);
         }
+
+        // Point the blit pass at the present node's intermediate.
+        let present_view = &self.intermediates[self.present_index]
+            .as_ref()
+            .expect("present intermediate must be allocated")
+            .view;
+        self.blit.set_source(device, present_view);
     }
 
-    /// Walk the schedule, recording each node into `ctx.encoder`. The caller
-    /// supplies `ctx.output` for the present node; non-present nodes render
-    /// into their owned intermediate views.
+    /// Walk the schedule (every node renders into its own intermediate),
+    /// then run the blit pass to copy the present node's intermediate into
+    /// `ctx.output`.
     pub fn render(&self, ctx: &mut NodeContext<'_>) {
         for &node_idx in &self.schedule {
-            let output: &wgpu::TextureView = if node_idx == self.present_index {
-                ctx.output
-            } else {
-                &self.intermediates[node_idx]
-                    .as_ref()
-                    .expect("intermediate must be allocated by resize before render")
-                    .view
-            };
+            let output = &self.intermediates[node_idx]
+                .as_ref()
+                .expect("intermediate must be allocated by resize before render")
+                .view;
             let mut sub_ctx = NodeContext {
                 encoder: &mut *ctx.encoder,
                 queue: ctx.queue,
@@ -615,6 +782,7 @@ impl RenderGraph {
             };
             self.nodes[node_idx].impl_.record(&mut sub_ctx);
         }
+        self.blit.record(ctx.encoder, ctx.output);
     }
 }
 

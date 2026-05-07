@@ -25,7 +25,7 @@
 id = "mandelbrot"
 kind = "glsl"
 inputs = []
-present = false
+present = true
 
 vert = '''
 #version 450
@@ -104,7 +104,7 @@ void main() {
 id = "invert"
 kind = "glsl"
 inputs = ["mandelbrot"]
-present = true
+present = false
 
 vert = '''
 #version 450

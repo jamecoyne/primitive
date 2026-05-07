@@ -131,7 +131,7 @@ impl State {
         surface.configure(&device, &config);
 
         let mut graph = RenderGraph::from_toml(&device, view_format, DEFAULT_GRAPH_TOML)
-            .expect("config/graph.toml is valid at compile time");
+            .unwrap_or_else(|e| panic!("config/graph.toml: {e}"));
         // Allocate intermediates + bind groups for the initial canvas size.
         // resize() must run before the first render.
         graph.resize(&device, size.width, size.height);
@@ -449,7 +449,7 @@ pub async fn render_offscreen(cfg: RenderConfig) -> Vec<u8> {
 
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut graph = RenderGraph::from_toml(&device, format, DEFAULT_GRAPH_TOML)
-        .expect("config/graph.toml is valid at compile time");
+        .unwrap_or_else(|e| panic!("config/graph.toml: {e}"));
     graph.resize(&device, cfg.width, cfg.height);
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
