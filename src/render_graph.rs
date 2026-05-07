@@ -620,6 +620,121 @@ impl Blitter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SolidFill — fullscreen-triangle pipeline whose fragment outputs a single
+// hardcoded color and takes no bindings. Used for the per-viewer border
+// pass; expand a viewer's rect, fill it with this, then blit the
+// thumbnail on top to leave a border ring.
+// ---------------------------------------------------------------------------
+
+const SOLID_FILL_VERT: &str = "#version 450
+void main() {
+    vec2 pos = vec2(
+        float((gl_VertexIndex & 1) * 4) - 1.0,
+        float((gl_VertexIndex & 2) * 2) - 1.0
+    );
+    gl_Position = vec4(pos, 0.0, 1.0);
+}
+";
+
+const SOLID_FILL_FRAG: &str = "#version 450
+layout(location = 0) out vec4 o_color;
+void main() {
+    // Near-black with a slight cool tint — readable border around any
+    // thumbnail content (the magenta source and the inverted thumbnail
+    // both have light-coloured surrounds, so a dark border stands out).
+    o_color = vec4(0.07, 0.07, 0.09, 1.0);
+}
+";
+
+struct SolidFill {
+    pipeline: wgpu::RenderPipeline,
+}
+
+impl SolidFill {
+    fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat, label: &str) -> Self {
+        let vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(&format!("{label}.vert")),
+            source: wgpu::ShaderSource::Glsl {
+                shader: SOLID_FILL_VERT.into(),
+                stage: wgpu::naga::ShaderStage::Vertex,
+                defines: Default::default(),
+            },
+        });
+        let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(&format!("{label}.frag")),
+            source: wgpu::ShaderSource::Glsl {
+                shader: SOLID_FILL_FRAG.into(),
+                stage: wgpu::naga::ShaderStage::Fragment,
+                defines: Default::default(),
+            },
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("{label}:pipeline-layout")),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&format!("{label}:pipeline")),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &vs,
+                entry_point: Some("main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fs,
+                entry_point: Some("main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        Self { pipeline }
+    }
+
+    /// Fill `viewport` with the constant fragment color. Uses
+    /// `LoadOp::Load` so pixels outside the viewport are preserved.
+    fn record_overlay(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        viewport: [f32; 4],
+        label: &str,
+        ts_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: ts_writes,
+        });
+        pass.set_viewport(viewport[0], viewport[1], viewport[2], viewport[3], 0.0, 1.0);
+        pass.set_pipeline(&self.pipeline);
+        pass.draw(0..3, 0..1);
+    }
+}
+
 #[derive(Debug)]
 pub enum GraphError {
     Config(String),
@@ -708,18 +823,25 @@ pub struct RenderGraph {
     /// Blit pipeline that targets `INTERMEDIATE_FORMAT`. Shared across
     /// every viewer-enabled node.
     viewer_blit: Blitter,
+    /// Solid-color fill used for the thick border drawn behind each
+    /// viewer thumbnail. Targets `present_format`.
+    border_fill: SolidFill,
     /// Optional GPU timestamps. `None` when the device didn't expose
     /// `Features::TIMESTAMP_QUERY` (web fallback, older drivers).
     /// Enabled by `enable_perf_monitor` after build.
     perf: Option<PerfMonitor>,
     /// Pre-built per-pass labels so `next_writes` doesn't re-`format!`
-    /// every frame. One per node for each of the three pass sites.
+    /// every frame. One per node for each of the four pass sites.
     schedule_labels: Vec<String>,
     viewer_downsample_labels: Vec<String>,
+    viewer_border_labels: Vec<String>,
     viewer_pip_labels: Vec<String>,
     width: u32,
     height: u32,
 }
+
+/// Pixel thickness of the border drawn around each viewer thumbnail.
+const VIEWER_BORDER_PX: u32 = 6;
 
 /// Per-node viewer state — a thumbnail-sized texture filled every frame
 /// by downsampling the node's full intermediate. Two bind groups because
@@ -894,6 +1016,7 @@ impl RenderGraph {
             cfg.nodes.iter().map(|n| n.viewer.clone()).collect();
         let present_blit = Blitter::new(device, present_format, "present-blit");
         let viewer_blit = Blitter::new(device, INTERMEDIATE_FORMAT, "viewer-blit");
+        let border_fill = SolidFill::new(device, present_format, "viewer-border");
 
         log::info!(
             "render graph built: {} node(s), schedule = {:?}, present = {:?}, viewers = {:?}",
@@ -921,6 +1044,10 @@ impl RenderGraph {
             .iter()
             .map(|e| format!("viewer-down:{}", e.id))
             .collect();
+        let viewer_border_labels = nodes
+            .iter()
+            .map(|e| format!("viewer-border:{}", e.id))
+            .collect();
         let viewer_pip_labels = nodes
             .iter()
             .map(|e| format!("viewer-pip:{}", e.id))
@@ -936,9 +1063,11 @@ impl RenderGraph {
             present_blit,
             present_bind_group: None,
             viewer_blit,
+            border_fill,
             perf: None,
             schedule_labels,
             viewer_downsample_labels,
+            viewer_border_labels,
             viewer_pip_labels,
             width: 0,
             height: 0,
@@ -1162,16 +1291,39 @@ impl RenderGraph {
         );
         passes += 1;
 
-        // PiP overlays — draw each viewer thumbnail at its configured
-        // pixel offset. Skip silently when a thumbnail would overflow
-        // the canvas in either axis so a misconfigured offset doesn't
-        // blow up the render.
+        // PiP overlays — draw a solid border behind each viewer thumbnail
+        // and then blit the thumbnail on top of it. Skip silently when a
+        // thumbnail would overflow the canvas in either axis so a
+        // misconfigured offset doesn't blow up the render.
         for i in 0..self.viewers.len() {
             let Some(v) = &self.viewers[i] else { continue };
             let [x, y] = self.viewer_configs[i].position;
             if x + v.width > ctx.width || y + v.height > ctx.height {
                 continue;
             }
+
+            // Border pass: expand the rect by VIEWER_BORDER_PX on every
+            // side, clamped to the canvas. Drawing the solid fill first
+            // and then the thumbnail on top leaves a visible ring.
+            let bx = x.saturating_sub(VIEWER_BORDER_PX);
+            let by = y.saturating_sub(VIEWER_BORDER_PX);
+            let bw = (v.width + VIEWER_BORDER_PX * 2).min(ctx.width - bx);
+            let bh = (v.height + VIEWER_BORDER_PX * 2).min(ctx.height - by);
+            let border_label = format!("{}:viewer:border-pass", self.nodes[i].id);
+            let border_writes = self
+                .perf
+                .as_mut()
+                .and_then(|p| p.next_writes(&self.viewer_border_labels[i]));
+            self.border_fill.record_overlay(
+                ctx.encoder,
+                ctx.output,
+                [bx as f32, by as f32, bw as f32, bh as f32],
+                &border_label,
+                border_writes,
+            );
+            passes += 1;
+
+            // Thumbnail blit on top.
             let label = format!("{}:viewer:pip-pass", self.nodes[i].id);
             let writes = self
                 .perf
