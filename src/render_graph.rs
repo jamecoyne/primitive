@@ -550,6 +550,42 @@ impl Blitter {
         pass.set_bind_group(0, bind_group, &[]);
         pass.draw(0..3, 0..1);
     }
+
+    /// Variant of `record` that draws into a sub-rect of the target without
+    /// clearing the rest. Used to lay PiP viewer thumbnails on top of the
+    /// already-blitted swapchain. `viewport` is `[x, y, width, height]` in
+    /// physical pixels with the framebuffer's top-left as origin.
+    fn record_overlay(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bind_group: &wgpu::BindGroup,
+        target: &wgpu::TextureView,
+        viewport: [f32; 4],
+        label: &str,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    // Preserve everything outside the viewport (the present
+                    // blit just wrote it).
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+        pass.set_viewport(
+            viewport[0], viewport[1], viewport[2], viewport[3], 0.0, 1.0,
+        );
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
 }
 
 #[derive(Debug)]
@@ -636,15 +672,23 @@ pub struct RenderGraph {
 }
 
 /// Per-node viewer state — a thumbnail-sized texture filled every frame
-/// by downsampling the node's full intermediate. The bind group is bound
-/// to the source intermediate, and `viewer_blit` writes into `view`.
+/// by downsampling the node's full intermediate. Two bind groups because
+/// the two passes that read/write the viewer use blitters with different
+/// target formats (and therefore different bind-group layouts):
+///
+///   - `downsample_bg` is bound to the source intermediate; consumed by
+///     `viewer_blit` (target = INTERMEDIATE_FORMAT) to fill `view`.
+///   - `pip_bg` is bound to `view` itself; consumed by `present_blit`
+///     (target = present_format) to overlay the thumbnail on the
+///     swapchain.
 struct Viewer {
     #[allow(dead_code)]
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     width: u32,
     height: u32,
-    bind_group: wgpu::BindGroup,
+    downsample_bg: wgpu::BindGroup,
+    pip_bg: wgpu::BindGroup,
 }
 
 /// Read-only handle to one viewer's texture, returned from
@@ -889,17 +933,23 @@ impl RenderGraph {
                 .as_ref()
                 .expect("intermediate just allocated above")
                 .view;
-            let bind_group = self.viewer_blit.make_bind_group(
+            let downsample_bg = self.viewer_blit.make_bind_group(
                 device,
                 source_view,
-                &format!("{}:viewer:bind-group", entry.id),
+                &format!("{}:viewer:downsample-bg", entry.id),
+            );
+            let pip_bg = self.present_blit.make_bind_group(
+                device,
+                &view,
+                &format!("{}:viewer:pip-bg", entry.id),
             );
             self.viewers[i] = Some(Viewer {
                 texture,
                 view,
                 width: vw,
                 height: vh,
-                bind_group,
+                downsample_bg,
+                pip_bg,
             });
         }
     }
@@ -927,12 +977,13 @@ impl RenderGraph {
         }
 
         // Viewer downsamples — independent of present, can run in any
-        // order relative to it.
+        // order relative to it. Must precede the PiP overlays below since
+        // those sample the textures these passes write.
         for (i, viewer) in self.viewers.iter().enumerate() {
             if let Some(v) = viewer {
-                let label = format!("{}:viewer:pass", self.nodes[i].id);
+                let label = format!("{}:viewer:downsample-pass", self.nodes[i].id);
                 self.viewer_blit
-                    .record(ctx.encoder, &v.bind_group, &v.view, &label);
+                    .record(ctx.encoder, &v.downsample_bg, &v.view, &label);
             }
         }
 
@@ -942,6 +993,36 @@ impl RenderGraph {
             .expect("present_bind_group not set — graph.resize must run before render");
         self.present_blit
             .record(ctx.encoder, present_bg, ctx.output, "present-blit:pass");
+
+        // PiP overlays — draw each viewer thumbnail in the top-left corner
+        // of the swapchain, stacked vertically with a 16-pixel margin.
+        // Skip silently when a thumbnail wouldn't fit so a tiny viewport
+        // doesn't blow up.
+        const MARGIN: u32 = 16;
+        let mut y = MARGIN;
+        for (i, viewer) in self.viewers.iter().enumerate() {
+            let Some(v) = viewer else { continue };
+            if MARGIN + v.width > ctx.width {
+                continue;
+            }
+            if y + v.height + MARGIN > ctx.height {
+                break;
+            }
+            let label = format!("{}:viewer:pip-pass", self.nodes[i].id);
+            self.present_blit.record_overlay(
+                ctx.encoder,
+                &v.pip_bg,
+                ctx.output,
+                [
+                    MARGIN as f32,
+                    y as f32,
+                    v.width as f32,
+                    v.height as f32,
+                ],
+                &label,
+            );
+            y += v.height + MARGIN;
+        }
     }
 
     /// Returns a slot for every node where `viewer.enabled = true`. The
