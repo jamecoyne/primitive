@@ -21,15 +21,23 @@
 #               The graph topologically sorts by `inputs`, so the order in
 #               this file doesn't matter — declare nodes wherever it reads
 #               most clearly.
+#   viewer    : optional inline table { enabled, resolution }. When
+#               `enabled = true`, the node's full intermediate is
+#               downsampled every frame into a thumbnail-sized texture
+#               (default 128 × 96) for a developer-facing preview UI.
+#               Inspired by TouchDesigner's per-operator viewer toggle.
+#               Example: `viewer = { enabled = true, resolution = [256, 192] }`
 
 [out]
 input = "invert"
 
 # 1) Mandelbrot — generates the fractal into an intermediate texture.
+#    Viewer enabled so a preview UI can sample the un-inverted output.
 [[node]]
 id = "mandelbrot"
 kind = "glsl"
 inputs = []
+viewer = { enabled = true, resolution = [256, 192] }
 
 vert = '''
 #version 450

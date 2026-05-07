@@ -20,6 +20,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
 
+use wgpuweb::render_graph::{RenderGraph, DEFAULT_GRAPH_TOML};
 use wgpuweb::{render_offscreen, RenderConfig};
 
 const W: u32 = 960;
@@ -113,4 +114,67 @@ fn mouse_changes_image() {
         "moving mouse_uv from center to (0.1, 0.1) only changed image by {diff:.2}/255 \
          (need ≥ {MIN_MOUSE_DIFF}); mouse uniform might not be applied"
     );
+}
+
+/// Build the default graph and assert that every node with `viewer.enabled =
+/// true` in `config/graph.toml` shows up in `viewer_textures()` at the
+/// configured resolution. Surfaces a regression if either the schema parse
+/// or the per-node texture allocation breaks.
+#[test]
+fn viewer_textures_match_config() {
+    pollster::block_on(async {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("no adapter");
+        let (device, _queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("viewer-test-device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    memory_hints: wgpu::MemoryHints::default(),
+                },
+                None,
+            )
+            .await
+            .expect("request_device");
+
+        let mut graph = RenderGraph::from_toml(
+            &device,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            DEFAULT_GRAPH_TOML,
+        )
+        .expect("graph builds from default TOML");
+        graph.resize(&device, 1024, 800);
+
+        let viewers = graph.viewer_textures();
+        // Default config has the mandelbrot viewer enabled at 256×192.
+        let mandel = viewers
+            .iter()
+            .find(|v| v.node_id == "mandelbrot")
+            .expect("mandelbrot viewer slot missing");
+        assert_eq!(
+            (mandel.width, mandel.height),
+            (256, 192),
+            "mandelbrot viewer resolution should match `viewer.resolution` in graph.toml"
+        );
+
+        // Anything else we declared `viewer.enabled = false` (or omitted)
+        // must NOT appear here.
+        for v in &viewers {
+            assert_ne!(
+                v.node_id, "invert",
+                "invert has no `viewer.enabled = true` so it shouldn't appear in viewer_textures"
+            );
+        }
+    });
 }
