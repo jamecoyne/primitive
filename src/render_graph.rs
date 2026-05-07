@@ -45,11 +45,22 @@ pub struct NodeContext<'a> {
 /// (and again on resize) with views for every declared input slot, in the
 /// order they appear in `NodeConfig::inputs`.
 ///
+/// `record` takes an `Option<RenderPassTimestampWrites>`: when the device
+/// supports `Features::TIMESTAMP_QUERY` and the perf monitor is active,
+/// the graph allocates two query indices per pass and threads them in.
+/// Implementations should plumb the option directly into the
+/// `RenderPassDescriptor::timestamp_writes` field; pass `None` and the
+/// pass runs untimed.
+///
 /// No `Send + Sync` bound — wgpu's pipeline/buffer/bind-group handles are
 /// `!Send + !Sync` on wasm32 (they wrap JS handles), and the graph is only
 /// ever walked from the render thread.
 pub trait Node {
-    fn record(&self, ctx: &mut NodeContext<'_>);
+    fn record(
+        &self,
+        ctx: &mut NodeContext<'_>,
+        ts_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    );
     /// Build (or rebuild) the bind group with the given input texture views.
     /// `views.len()` always matches the node's declared input count.
     fn set_inputs(&mut self, device: &wgpu::Device, views: &[&wgpu::TextureView]);
@@ -212,7 +223,11 @@ impl GlslNode {
 }
 
 impl Node for GlslNode {
-    fn record(&self, ctx: &mut NodeContext<'_>) {
+    fn record(
+        &self,
+        ctx: &mut NodeContext<'_>,
+        ts_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
         let bind_group = self
             .bind_group
             .as_ref()
@@ -240,7 +255,7 @@ impl Node for GlslNode {
             })],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
-            timestamp_writes: None,
+            timestamp_writes: ts_writes,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bind_group, &[]);
@@ -550,6 +565,7 @@ impl Blitter {
         bind_group: &wgpu::BindGroup,
         target: &wgpu::TextureView,
         label: &str,
+        ts_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
@@ -563,7 +579,7 @@ impl Blitter {
             })],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
-            timestamp_writes: None,
+            timestamp_writes: ts_writes,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bind_group, &[]);
@@ -581,6 +597,7 @@ impl Blitter {
         target: &wgpu::TextureView,
         viewport: [f32; 4],
         label: &str,
+        ts_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
@@ -596,7 +613,7 @@ impl Blitter {
             })],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
-            timestamp_writes: None,
+            timestamp_writes: ts_writes,
         });
         pass.set_viewport(
             viewport[0], viewport[1], viewport[2], viewport[3], 0.0, 1.0,
@@ -695,6 +712,15 @@ pub struct RenderGraph {
     /// Blit pipeline that targets `INTERMEDIATE_FORMAT`. Shared across
     /// every viewer-enabled node.
     viewer_blit: Blitter,
+    /// Optional GPU timestamps. `None` when the device didn't expose
+    /// `Features::TIMESTAMP_QUERY` (web fallback, older drivers).
+    /// Enabled by `enable_perf_monitor` after build.
+    perf: Option<PerfMonitor>,
+    /// Pre-built per-pass labels so `next_writes` doesn't re-`format!`
+    /// every frame. One per node for each of the three pass sites.
+    schedule_labels: Vec<String>,
+    viewer_downsample_labels: Vec<String>,
+    viewer_pip_labels: Vec<String>,
     width: u32,
     height: u32,
 }
@@ -759,9 +785,13 @@ pub struct NodeSummary {
     /// Whether `viewer.enabled = true` in the TOML.
     pub viewer_enabled: bool,
     /// Rolling-average CPU time spent inside this node's `record()`
-    /// call, in milliseconds. Reflects encoder dispatch only — real
-    /// GPU cook time will need timestamp queries (TODO).
+    /// call, in milliseconds. Reflects encoder dispatch only.
     pub dispatch_ms: f32,
+    /// Rolling-average GPU cook time for this node's schedule pass, in
+    /// milliseconds — measured via `Features::TIMESTAMP_QUERY` when the
+    /// device supports it. `None` when the perf monitor isn't running
+    /// or hasn't received a sample yet.
+    pub gpu_ms: Option<f32>,
 }
 
 struct Intermediate {
@@ -885,6 +915,21 @@ impl RenderGraph {
                 .collect::<Vec<_>>(),
         );
 
+        // Pre-build per-pass labels so PerfMonitor::next_writes doesn't
+        // reformat strings on every frame.
+        let schedule_labels = nodes
+            .iter()
+            .map(|e| format!("schedule:{}", e.id))
+            .collect();
+        let viewer_downsample_labels = nodes
+            .iter()
+            .map(|e| format!("viewer-down:{}", e.id))
+            .collect();
+        let viewer_pip_labels = nodes
+            .iter()
+            .map(|e| format!("viewer-pip:{}", e.id))
+            .collect();
+
         Ok(Self {
             nodes,
             schedule,
@@ -895,9 +940,37 @@ impl RenderGraph {
             present_blit,
             present_bind_group: None,
             viewer_blit,
+            perf: None,
+            schedule_labels,
+            viewer_downsample_labels,
+            viewer_pip_labels,
             width: 0,
             height: 0,
         })
+    }
+
+    /// Enable per-pass GPU cook timing. Must be called after `build` and
+    /// before the first `render` if you want the data flowing. Silently
+    /// no-ops on devices that don't expose `Features::TIMESTAMP_QUERY`.
+    pub fn enable_perf_monitor(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return;
+        }
+        let period = queue.get_timestamp_period();
+        self.perf = Some(PerfMonitor::new(device, period));
+        log::info!(
+            "perf monitor: enabled, timestamp period = {:.3} ns/tick",
+            period
+        );
+    }
+
+    /// Drives async readbacks for the perf monitor. Must be called once
+    /// per frame, **after** `queue.submit`. No-op when the perf monitor
+    /// isn't enabled.
+    pub fn poll_perf(&mut self, device: &wgpu::Device) {
+        if let Some(p) = &mut self.perf {
+            p.after_submit(device);
+        }
     }
 
     /// Convenience: parse + build from a raw TOML string.
@@ -1023,8 +1096,16 @@ impl RenderGraph {
     /// then run the present blit to copy the present node's intermediate
     /// into `ctx.output`. Returns counters describing the work submitted.
     pub fn render(&mut self, ctx: &mut NodeContext<'_>) -> FrameStats {
+        if let Some(p) = &mut self.perf {
+            p.begin_frame();
+        }
+
         let mut passes: u32 = 0;
-        for &node_idx in &self.schedule {
+        // Schedule walk. Split-borrow: `self.perf` and `self.nodes` are
+        // separate fields, so we can mut-borrow perf for next_writes()
+        // while still hitting nodes[i] for record() and dispatch_times.
+        let schedule = self.schedule.clone();
+        for node_idx in schedule {
             let output = &self.intermediates[node_idx]
                 .as_ref()
                 .expect("intermediate must be allocated by resize before render")
@@ -1038,8 +1119,12 @@ impl RenderGraph {
                 time: ctx.time,
                 mouse: ctx.mouse,
             };
+            let writes = self
+                .perf
+                .as_mut()
+                .and_then(|p| p.next_writes(&self.schedule_labels[node_idx]));
             let dispatch_start = web_time::Instant::now();
-            self.nodes[node_idx].impl_.record(&mut sub_ctx);
+            self.nodes[node_idx].impl_.record(&mut sub_ctx, writes);
             let dt = dispatch_start.elapsed().as_secs_f32();
             let entry = &mut self.nodes[node_idx];
             if entry.dispatch_times.len() == NODE_TIMING_WINDOW {
@@ -1052,21 +1137,33 @@ impl RenderGraph {
         // Viewer downsamples — independent of present, can run in any
         // order relative to it. Must precede the PiP overlays below since
         // those sample the textures these passes write.
-        for (i, viewer) in self.viewers.iter().enumerate() {
-            if let Some(v) = viewer {
-                let label = format!("{}:viewer:downsample-pass", self.nodes[i].id);
-                self.viewer_blit
-                    .record(ctx.encoder, &v.downsample_bg, &v.view, &label);
-                passes += 1;
-            }
+        for i in 0..self.viewers.len() {
+            let Some(v) = &self.viewers[i] else { continue };
+            let label = format!("{}:viewer:downsample-pass", self.nodes[i].id);
+            let writes = self
+                .perf
+                .as_mut()
+                .and_then(|p| p.next_writes(&self.viewer_downsample_labels[i]));
+            self.viewer_blit
+                .record(ctx.encoder, &v.downsample_bg, &v.view, &label, writes);
+            passes += 1;
         }
 
         let present_bg = self
             .present_bind_group
             .as_ref()
             .expect("present_bind_group not set — graph.resize must run before render");
-        self.present_blit
-            .record(ctx.encoder, present_bg, ctx.output, "present-blit:pass");
+        let present_writes = self
+            .perf
+            .as_mut()
+            .and_then(|p| p.next_writes("present-blit"));
+        self.present_blit.record(
+            ctx.encoder,
+            present_bg,
+            ctx.output,
+            "present-blit:pass",
+            present_writes,
+        );
         passes += 1;
 
         // PiP overlays — draw each viewer thumbnail at its configured
@@ -1075,21 +1172,32 @@ impl RenderGraph {
         // thumbnail wouldn't fit so a tiny viewport doesn't blow up.
         const MARGIN: u32 = 16;
         let mut cursors = CornerCursors::new(ctx.width, ctx.height, MARGIN);
-        for (i, viewer) in self.viewers.iter().enumerate() {
-            let Some(v) = viewer else { continue };
+        for i in 0..self.viewers.len() {
+            let Some(v) = &self.viewers[i] else { continue };
             let position = self.viewer_configs[i].position;
             let Some((x, y)) = cursors.place(v.width, v.height, position) else {
                 continue;
             };
             let label = format!("{}:viewer:pip-pass", self.nodes[i].id);
+            let writes = self
+                .perf
+                .as_mut()
+                .and_then(|p| p.next_writes(&self.viewer_pip_labels[i]));
             self.present_blit.record_overlay(
                 ctx.encoder,
                 &v.pip_bg,
                 ctx.output,
                 [x as f32, y as f32, v.width as f32, v.height as f32],
                 &label,
+                writes,
             );
             passes += 1;
+        }
+
+        // Resolve query set + copy into a readback buffer (no-op when the
+        // perf monitor isn't enabled).
+        if let Some(p) = &mut self.perf {
+            p.end_frame(ctx.encoder);
         }
 
         FrameStats { passes }
@@ -1132,6 +1240,10 @@ impl RenderGraph {
                     let sum: f32 = entry.dispatch_times.iter().sum();
                     sum / entry.dispatch_times.len() as f32 * 1000.0
                 };
+                let gpu_ms = self
+                    .perf
+                    .as_ref()
+                    .and_then(|p| p.timing_ms(&self.schedule_labels[i]));
                 NodeSummary {
                     id: entry.id.clone(),
                     depth: depths[i],
@@ -1139,6 +1251,7 @@ impl RenderGraph {
                     is_present: i == self.present_index,
                     viewer_enabled: self.viewer_configs[i].enabled,
                     dispatch_ms,
+                    gpu_ms,
                 }
             })
             .collect();
@@ -1320,5 +1433,233 @@ impl CornerCursors {
                 Some((x, y))
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PerfMonitor — wgpu timestamp queries with non-blocking readback.
+//
+// One QuerySet sized 2 × `PERF_PASS_CAPACITY` (begin + end timestamps per
+// pass). Each frame the graph hands out `RenderPassTimestampWrites` from
+// `next_writes(label)`; at end_frame we resolve the query set into an
+// intermediate buffer and copy that into one of two readback buffers.
+// `after_submit` ingests any prior frame whose map_async has completed and
+// kicks off mapping for the current frame on the OTHER readback buffer.
+// Skipping a frame happens silently when both buffers are still in-flight.
+// ---------------------------------------------------------------------------
+
+const PERF_PASS_CAPACITY: u32 = 32;
+const PERF_QUERY_CAPACITY: u32 = PERF_PASS_CAPACITY * 2;
+const PERF_BUFFER_BYTES: u64 = (PERF_QUERY_CAPACITY as u64) * 8;
+/// Smoothing window — same as lib::FRAME_WINDOW.
+const PERF_AVG_WINDOW: usize = 60;
+
+pub struct PerfMonitor {
+    query_set: wgpu::QuerySet,
+    period_ns_per_tick: f32,
+    /// `QUERY_RESOLVE | COPY_SRC` intermediate; `resolve_query_set` writes here.
+    resolve_buffer: wgpu::Buffer,
+    /// Two CPU-readable buffers we ping-pong between to keep readback
+    /// non-blocking. At most one is being written this frame; at most one
+    /// is mid-`map_async` from a prior frame.
+    readbacks: [PerfReadback; 2],
+    /// Per-frame allocation cursor (how many query indices have been
+    /// handed out by `next_writes` this frame).
+    next_query: u32,
+    /// Labels for the queries we've issued this frame, paralleling
+    /// `next_query/2` entries. Moves into the readback when we resolve.
+    pending_labels: Vec<String>,
+    /// Smoothed per-label cook times in ms. Updated as buffers map back.
+    timings: std::collections::HashMap<String, std::collections::VecDeque<f32>>,
+    /// True when end_frame has actually copied data into a readback this
+    /// frame and we should kick off its map_async after submit.
+    pending_write_idx: Option<usize>,
+}
+
+struct PerfReadback {
+    buffer: wgpu::Buffer,
+    /// Labels for the frame whose data is parked in this buffer (or
+    /// being mapped). `len` ≤ PERF_PASS_CAPACITY.
+    labels: Vec<String>,
+    /// Number of u64 query slots actually populated for the parked frame.
+    query_count: u32,
+    /// `map_async` outstanding on this buffer.
+    in_flight: bool,
+    /// Receiver for the `map_async` completion. None if not in flight.
+    rx: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+}
+
+impl PerfMonitor {
+    pub fn new(device: &wgpu::Device, period_ns_per_tick: f32) -> Self {
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("perf:query-set"),
+            ty: wgpu::QueryType::Timestamp,
+            count: PERF_QUERY_CAPACITY,
+        });
+        let resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("perf:resolve"),
+            size: PERF_BUFFER_BYTES,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let make_readback = |i: usize| {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("perf:readback[{i}]")),
+                size: PERF_BUFFER_BYTES,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            PerfReadback {
+                buffer,
+                labels: Vec::with_capacity(PERF_PASS_CAPACITY as usize),
+                query_count: 0,
+                in_flight: false,
+                rx: None,
+            }
+        };
+        Self {
+            query_set,
+            period_ns_per_tick,
+            resolve_buffer,
+            readbacks: [make_readback(0), make_readback(1)],
+            next_query: 0,
+            pending_labels: Vec::with_capacity(PERF_PASS_CAPACITY as usize),
+            timings: std::collections::HashMap::new(),
+            pending_write_idx: None,
+        }
+    }
+
+    pub fn begin_frame(&mut self) {
+        self.next_query = 0;
+        self.pending_labels.clear();
+        self.pending_write_idx = None;
+    }
+
+    /// Reserve two timestamp slots and return the descriptor to plug into
+    /// the next `begin_render_pass`. Returns `None` once we exhaust the
+    /// per-frame budget (`PERF_PASS_CAPACITY`).
+    pub fn next_writes(&mut self, label: &str) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        if self.next_query + 2 > PERF_QUERY_CAPACITY {
+            return None;
+        }
+        let begin = self.next_query;
+        self.next_query += 2;
+        self.pending_labels.push(label.to_string());
+        Some(wgpu::RenderPassTimestampWrites {
+            query_set: &self.query_set,
+            beginning_of_pass_write_index: Some(begin),
+            end_of_pass_write_index: Some(begin + 1),
+        })
+    }
+
+    /// Insert resolve + copy commands into `encoder`. Skips the frame if
+    /// both readbacks are still mid-flight (data dropped silently — the
+    /// HUD just shows the most recent successful sample). Picks an idle
+    /// readback buffer; remembers it for `after_submit` to map.
+    pub fn end_frame(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if self.next_query == 0 {
+            return;
+        }
+        let target = if !self.readbacks[0].in_flight {
+            0
+        } else if !self.readbacks[1].in_flight {
+            1
+        } else {
+            // Both buffers are still mapping from earlier frames; skip
+            // resolving this frame. Smoothed timings just keep their
+            // most-recent values.
+            return;
+        };
+
+        encoder.resolve_query_set(
+            &self.query_set,
+            0..self.next_query,
+            &self.resolve_buffer,
+            0,
+        );
+        let bytes = (self.next_query as u64) * 8;
+        encoder.copy_buffer_to_buffer(
+            &self.resolve_buffer,
+            0,
+            &self.readbacks[target].buffer,
+            0,
+            bytes,
+        );
+        let rb = &mut self.readbacks[target];
+        rb.labels.clear();
+        rb.labels.extend(self.pending_labels.iter().cloned());
+        rb.query_count = self.next_query;
+        self.pending_write_idx = Some(target);
+    }
+
+    /// After `queue.submit`: ingest any completed prior-frame readbacks,
+    /// then start `map_async` on this frame's readback if `end_frame`
+    /// chose one. Drives the wgpu callback queue via `device.poll(Poll)`
+    /// (no-op on web; native needs it to fire callbacks).
+    pub fn after_submit(&mut self, device: &wgpu::Device) {
+        // Ingest completed prior frames.
+        for i in 0..2 {
+            let rx_done = match &self.readbacks[i].rx {
+                Some(rx) => matches!(rx.try_recv(), Ok(Ok(()))),
+                None => false,
+            };
+            if rx_done {
+                self.ingest(i);
+            }
+        }
+
+        // Kick off map_async on this frame's readback.
+        if let Some(i) = self.pending_write_idx.take() {
+            let bytes = (self.readbacks[i].query_count as u64) * 8;
+            let slice = self.readbacks[i].buffer.slice(0..bytes);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            self.readbacks[i].in_flight = true;
+            self.readbacks[i].rx = Some(rx);
+        }
+
+        // Drive callbacks; no-op on web (JS event loop handles it).
+        let _ = device.poll(wgpu::Maintain::Poll);
+    }
+
+    fn ingest(&mut self, i: usize) {
+        let labels = std::mem::take(&mut self.readbacks[i].labels);
+        let bytes = (self.readbacks[i].query_count as u64) * 8;
+        {
+            let slice = self.readbacks[i].buffer.slice(0..bytes);
+            let data = slice.get_mapped_range();
+            let timestamps: &[u64] = bytemuck::cast_slice(&data);
+            for (idx, label) in labels.iter().enumerate() {
+                let begin = timestamps[idx * 2];
+                let end = timestamps[idx * 2 + 1];
+                let ticks = end.saturating_sub(begin);
+                let ms = (ticks as f32 * self.period_ns_per_tick) / 1_000_000.0;
+                let entry = self
+                    .timings
+                    .entry(label.clone())
+                    .or_insert_with(|| {
+                        std::collections::VecDeque::with_capacity(PERF_AVG_WINDOW)
+                    });
+                if entry.len() == PERF_AVG_WINDOW {
+                    entry.pop_front();
+                }
+                entry.push_back(ms);
+            }
+        }
+        self.readbacks[i].buffer.unmap();
+        self.readbacks[i].in_flight = false;
+        self.readbacks[i].rx = None;
+        self.readbacks[i].query_count = 0;
+    }
+
+    /// Most recent rolling-average ms for `label`, or `None` if no samples
+    /// have come back yet.
+    pub fn timing_ms(&self, label: &str) -> Option<f32> {
+        self.timings.get(label).filter(|d| !d.is_empty()).map(|d| {
+            let sum: f32 = d.iter().sum();
+            sum / d.len() as f32
+        })
     }
 }

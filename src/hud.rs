@@ -265,12 +265,14 @@ impl Hud {
 
     /// Draw the HUD bitmap into a sub-rect of `target` with alpha blending.
     /// `viewport` is `[x, y, width, height]` in physical pixels (top-left
-    /// origin).
+    /// origin). `ts_writes` lets the perf monitor wrap this pass so its
+    /// own dispatch shows up in the per-pass GPU column.
     pub fn record(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         viewport: [f32; 4],
+        ts_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("hud:pass"),
@@ -285,7 +287,7 @@ impl Hud {
             })],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
-            timestamp_writes: None,
+            timestamp_writes: ts_writes,
         });
         pass.set_viewport(viewport[0], viewport[1], viewport[2], viewport[3], 0.0, 1.0);
         pass.set_pipeline(&self.pipeline);
@@ -315,5 +317,20 @@ pub fn gpu_label(info: &wgpu::AdapterInfo) -> String {
         format!("(browser {})", backend_label(info.backend))
     } else {
         info.name.clone()
+    }
+}
+
+/// Format the adapter's `device_type` for the HUD. Drivers that don't
+/// distinguish (browsers usually) report `Other`; we surface that as
+/// `(unknown)` so the HUD makes it clear the platform isn't reporting
+/// the device class. `Cpu` is the smoking gun for "we're on a software
+/// fallback, not the GPU".
+pub fn device_type_label(t: wgpu::DeviceType) -> &'static str {
+    match t {
+        wgpu::DeviceType::IntegratedGpu => "integrated GPU",
+        wgpu::DeviceType::DiscreteGpu => "discrete GPU",
+        wgpu::DeviceType::VirtualGpu => "virtual GPU",
+        wgpu::DeviceType::Cpu => "CPU (software!)",
+        wgpu::DeviceType::Other => "(unknown)",
     }
 }

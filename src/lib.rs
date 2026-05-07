@@ -99,6 +99,14 @@ impl State {
 
         let adapter_info = adapter.get_info();
         log::info!("adapter: {:?}", adapter_info);
+        log::info!(
+            "rendering on {} via {}",
+            hud::device_type_label(adapter_info.device_type),
+            hud::backend_label(adapter_info.backend),
+        );
+        if adapter_info.device_type == wgpu::DeviceType::Cpu {
+            log::warn!("wgpu picked a CPU adapter — work is NOT running on the GPU");
+        }
 
         let required_limits = if cfg!(target_arch = "wasm32") {
             wgpu::Limits::downlevel_webgl2_defaults()
@@ -106,11 +114,24 @@ impl State {
             wgpu::Limits::default()
         };
 
+        // Opt in to TIMESTAMP_QUERY only when the adapter advertises it.
+        // Hardware-accelerated Metal/Vulkan/D3D12 always do; Chrome's
+        // WebGPU exposes it behind a runtime flag; older WebGL2 paths
+        // never will. Without it, the HUD's GPU-cook column stays "—".
+        let mut required_features = wgpu::Features::empty();
+        let supports_timestamps = adapter
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY);
+        if supports_timestamps {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+        log::info!("TIMESTAMP_QUERY: {}", supports_timestamps);
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("device"),
-                    required_features: wgpu::Features::empty(),
+                    required_features,
                     required_limits,
                     memory_hints: wgpu::MemoryHints::default(),
                 },
@@ -155,6 +176,9 @@ impl State {
         // Allocate intermediates + bind groups for the initial canvas size.
         // resize() must run before the first render.
         graph.resize(&device, size.width, size.height);
+        // Enable per-pass GPU timestamps if the device supports them.
+        // No-ops on adapters that didn't advertise TIMESTAMP_QUERY.
+        graph.enable_perf_monitor(&device, &queue);
 
         let hud = Hud::new(&device, view_format);
 
@@ -290,12 +314,16 @@ impl State {
                     hud_w as f32,
                     hud_h as f32,
                 ];
-                self.hud.record(&mut encoder, &view, viewport);
+                self.hud.record(&mut encoder, &view, viewport, None);
             }
         }
 
         self.queue.submit(Some(encoder.finish()));
         frame.present();
+
+        // Drive perf-monitor async readbacks. No-op when timestamps
+        // aren't enabled or are still in flight.
+        self.graph.poll_perf(&self.device);
 
         // Capture CPU work duration after submit. Smoothed across the same
         // 60-frame window as fps; fed back into the HUD on the *next* frame
@@ -461,22 +489,22 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 /// Build the multi-line HUD text from a graph summary + per-frame
-/// telemetry. Layout — fits in HUD_WIDTH ≈ 36 chars × HUD_HEIGHT ≈ 10 lines:
+/// telemetry. The right column shows GPU cook ms when the perf monitor
+/// is producing samples, otherwise CPU dispatch ms (the encoder-build
+/// time, near-zero) — the column header reflects which.
 ///
 /// ```text
-/// RENDER GRAPH         MB    REC ms
-/// mandelbrot v         3.13  0.02
-/// +- invert *  v       3.13  0.02
+/// RENDER GRAPH         MB    GPU ms
+/// mandelbrot v         3.13  0.42
+/// +- invert *  v       3.13  0.05
 /// total: 6.26 MiB / 8 passes
 /// GPU:     <adapter name>
+/// Type:    <integrated/discrete/cpu>
 /// Backend: <backend>  CPU: 0.31 ms
 /// FPS:     60.0
 /// ```
 ///
-/// `*` after a node = present node (its output goes to the swapchain).
-/// `v` after a node = `viewer.enabled = true`.
-/// REC ms is encoder-dispatch CPU time per node — NOT real GPU cook
-/// time; that needs `Features::TIMESTAMP_QUERY` plumbing (TODO).
+/// `*` = present node, `v` = `viewer.enabled = true`.
 fn build_hud_text(
     summary: &render_graph::GraphSummary,
     adapter_info: &wgpu::AdapterInfo,
@@ -484,11 +512,14 @@ fn build_hud_text(
     fps: f32,
     passes: u32,
 ) -> String {
-    let mut s = String::new();
-    s.push_str("RENDER GRAPH         MB    REC ms\n");
+    // Use GPU cook time when any node has a sample; otherwise fall back
+    // to dispatch time so the column never reads "—".
+    let has_gpu = summary.nodes.iter().any(|n| n.gpu_ms.is_some());
+    let header_unit = if has_gpu { "GPU ms" } else { "REC ms" };
 
-    // Per-node tree lines. Indent two spaces per depth and prefix the
-    // first descendant of each parent with `+- ` for a TD-ish look.
+    let mut s = String::new();
+    s.push_str(&format!("RENDER GRAPH         MB    {}\n", header_unit));
+
     for n in &summary.nodes {
         let indent = "  ".repeat(n.depth.max(1) as usize - if n.depth == 0 { 0 } else { 1 });
         let branch = if n.depth == 0 { "" } else { "+- " };
@@ -499,11 +530,14 @@ fn build_hud_text(
         if n.viewer_enabled {
             tags.push_str(" v");
         }
-        // Compose the left half (id + tags) padded to ~21 chars so the
-        // numeric columns line up.
         let left = format!("{indent}{branch}{}{}", n.id, tags);
         let mb = n.bytes as f32 / (1024.0 * 1024.0);
-        s.push_str(&format!("{:<21}{:>5.2} {:>6.2}\n", left, mb, n.dispatch_ms));
+        let ms = if has_gpu {
+            n.gpu_ms.unwrap_or(0.0)
+        } else {
+            n.dispatch_ms
+        };
+        s.push_str(&format!("{:<21}{:>5.2} {:>6.2}\n", left, mb, ms));
     }
 
     let total_mib = summary.total_bytes as f32 / (1024.0 * 1024.0);
@@ -512,6 +546,10 @@ fn build_hud_text(
         total_mib, passes
     ));
     s.push_str(&format!("GPU:     {}\n", hud::gpu_label(adapter_info)));
+    s.push_str(&format!(
+        "Type:    {}\n",
+        hud::device_type_label(adapter_info.device_type),
+    ));
     s.push_str(&format!(
         "Backend: {}  CPU: {:.2} ms\n",
         hud::backend_label(adapter_info.backend),
