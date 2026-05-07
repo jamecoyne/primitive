@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
@@ -54,6 +54,24 @@ struct State {
     /// Pass count from the most recent `graph.render` call. Updated each
     /// frame; not smoothed because it's deterministic from the config.
     last_pass_count: u32,
+    /// Latest cursor position from `WindowEvent::CursorMoved` (physical
+    /// pixels). Tracked even while dragging so we always know where the
+    /// pointer is on `MouseInput`.
+    cursor_pos: [f32; 2],
+    /// Active viewer-thumbnail drag, if any. While `Some`, the cursor's
+    /// CursorMoved updates the dragged viewer's position instead of the
+    /// mandelbrot uniform. Cleared on left-button release.
+    dragging: Option<DragState>,
+}
+
+#[derive(Clone, Copy)]
+struct DragState {
+    /// Index into `RenderGraph::viewer_textures()` (== node index).
+    viewer_index: usize,
+    /// Cursor → viewer-top-left offset captured at drag start, in
+    /// physical pixels. Subtracted from cursor each frame to keep the
+    /// drag-grab point under the pointer.
+    grab_offset: [f32; 2],
 }
 
 const FRAME_WINDOW: usize = 60;
@@ -204,6 +222,8 @@ impl State {
             frame_times: std::collections::VecDeque::with_capacity(FRAME_WINDOW),
             cpu_times: std::collections::VecDeque::with_capacity(FRAME_WINDOW),
             last_pass_count: 0,
+            cursor_pos: default_mouse,
+            dragging: None,
         }
     }
 
@@ -467,8 +487,56 @@ impl ApplicationHandler<UserEvent> for App {
                 state.window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if state.lock.mouse_uv.is_none() {
-                    state.mouse = [position.x as f32, position.y as f32];
+                let cursor = [position.x as f32, position.y as f32];
+                state.cursor_pos = cursor;
+                if let Some(drag) = state.dragging {
+                    // Convert cursor → desired thumbnail top-left, clamp
+                    // to canvas, push into the graph. The thumbnail's
+                    // size doesn't change so we read it from
+                    // `viewer_rect`.
+                    if let Some([_, _, w, h]) = state.graph.viewer_rect(drag.viewer_index) {
+                        let nx = (cursor[0] - drag.grab_offset[0]).max(0.0) as u32;
+                        let ny = (cursor[1] - drag.grab_offset[1]).max(0.0) as u32;
+                        let max_x = state.config.width.saturating_sub(w);
+                        let max_y = state.config.height.saturating_sub(h);
+                        state.graph.set_viewer_position(
+                            drag.viewer_index,
+                            [nx.min(max_x), ny.min(max_y)],
+                        );
+                    }
+                } else if state.lock.mouse_uv.is_none() {
+                    state.mouse = cursor;
+                }
+            }
+            WindowEvent::MouseInput {
+                button: MouseButton::Left,
+                state: button_state,
+                ..
+            } => {
+                // Tests use `lock.mouse_uv` to pin the cursor; if that's
+                // set, the headless path mustn't react to mouse buttons
+                // either or the rendered output stops being deterministic.
+                if state.lock.mouse_uv.is_some() {
+                    return;
+                }
+                match button_state {
+                    ElementState::Pressed => {
+                        let cu = [state.cursor_pos[0] as u32, state.cursor_pos[1] as u32];
+                        if let Some(idx) = state.graph.hit_test_viewer(cu) {
+                            if let Some([rx, ry, _, _]) = state.graph.viewer_rect(idx) {
+                                state.dragging = Some(DragState {
+                                    viewer_index: idx,
+                                    grab_offset: [
+                                        state.cursor_pos[0] - rx as f32,
+                                        state.cursor_pos[1] - ry as f32,
+                                    ],
+                                });
+                            }
+                        }
+                    }
+                    ElementState::Released => {
+                        state.dragging = None;
+                    }
                 }
             }
             WindowEvent::RedrawRequested => {

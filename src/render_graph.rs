@@ -1273,6 +1273,42 @@ impl RenderGraph {
         bytes
     }
 
+    /// Returns the on-screen rectangle of a viewer thumbnail in physical
+    /// pixels (`[x, y, width, height]`), or `None` if the index is out
+    /// of range or that node has no viewer enabled.
+    pub fn viewer_rect(&self, viewer_index: usize) -> Option<[u32; 4]> {
+        let v = self.viewers.get(viewer_index)?.as_ref()?;
+        let cfg = self.viewer_configs.get(viewer_index)?;
+        Some([cfg.position[0], cfg.position[1], v.width, v.height])
+    }
+
+    /// Update a viewer's pixel offset at runtime (e.g. from a drag
+    /// interaction). Returns `false` if the index is out of range.
+    pub fn set_viewer_position(&mut self, viewer_index: usize, position: [u32; 2]) -> bool {
+        match self.viewer_configs.get_mut(viewer_index) {
+            Some(cfg) => {
+                cfg.position = position;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Returns the index of the topmost viewer whose rect contains
+    /// `cursor` (physical pixels), or `None`. Iterates back-to-front so
+    /// later-rendered (visually topmost) thumbnails win when overlapping.
+    pub fn hit_test_viewer(&self, cursor: [u32; 2]) -> Option<usize> {
+        for i in (0..self.viewers.len()).rev() {
+            let Some([x, y, w, h]) = self.viewer_rect(i) else {
+                continue;
+            };
+            if cursor[0] >= x && cursor[0] < x + w && cursor[1] >= y && cursor[1] < y + h {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     /// Returns a slot for every node where `viewer.enabled = true`. The
     /// `view` references a texture filled by the most recent `render()`
     /// call; sample it from a downstream UI pipeline to draw the
