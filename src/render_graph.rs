@@ -659,7 +659,16 @@ struct NodeEntry {
     /// Upstream node indices in the order declared in `NodeConfig::inputs`.
     inputs: Vec<usize>,
     impl_: Box<dyn Node>,
+    /// Rolling buffer of CPU dispatch times (record() durations) in
+    /// seconds. Note: this is encoder build-up CPU time, NOT real GPU
+    /// cook time — the latter requires `Features::TIMESTAMP_QUERY` plus
+    /// ring-buffer async readback and is left as a follow-up.
+    dispatch_times: std::collections::VecDeque<f32>,
 }
+
+/// Window length for the dispatch-time ring on each node. Matches
+/// `lib::FRAME_WINDOW`.
+const NODE_TIMING_WINDOW: usize = 60;
 
 pub struct RenderGraph {
     nodes: Vec<NodeEntry>,
@@ -725,6 +734,34 @@ pub struct FrameStats {
     /// Total number of `begin_render_pass` calls the graph submitted —
     /// schedule walk + viewer downsamples + present blit + PiP overlays.
     pub passes: u32,
+}
+
+/// Snapshot of the graph's static structure + recent timings, returned
+/// from `RenderGraph::summary()`. Drives the perf-monitor HUD layout.
+#[derive(Debug, Clone)]
+pub struct GraphSummary {
+    pub nodes: Vec<NodeSummary>,
+    /// Sum of `bytes` across every entry, plus zero for any node that
+    /// has neither an intermediate nor a viewer allocated.
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeSummary {
+    pub id: String,
+    /// Distance from the deepest leaf — 0 for nodes with no inputs,
+    /// `max(input.depth) + 1` otherwise. Drives the tree indent.
+    pub depth: u32,
+    /// Width × height × 4 of (intermediate + viewer) for this node.
+    pub bytes: u64,
+    /// Whether this node is `[out].input`.
+    pub is_present: bool,
+    /// Whether `viewer.enabled = true` in the TOML.
+    pub viewer_enabled: bool,
+    /// Rolling-average CPU time spent inside this node's `record()`
+    /// call, in milliseconds. Reflects encoder dispatch only — real
+    /// GPU cook time will need timestamp queries (TODO).
+    pub dispatch_ms: f32,
 }
 
 struct Intermediate {
@@ -821,6 +858,7 @@ impl RenderGraph {
                 id: n.id.clone(),
                 inputs: input_indices[i].clone(),
                 impl_,
+                dispatch_times: std::collections::VecDeque::with_capacity(NODE_TIMING_WINDOW),
             });
         }
 
@@ -984,7 +1022,7 @@ impl RenderGraph {
     /// downsample any viewer-enabled nodes into their viewer textures,
     /// then run the present blit to copy the present node's intermediate
     /// into `ctx.output`. Returns counters describing the work submitted.
-    pub fn render(&self, ctx: &mut NodeContext<'_>) -> FrameStats {
+    pub fn render(&mut self, ctx: &mut NodeContext<'_>) -> FrameStats {
         let mut passes: u32 = 0;
         for &node_idx in &self.schedule {
             let output = &self.intermediates[node_idx]
@@ -1000,7 +1038,14 @@ impl RenderGraph {
                 time: ctx.time,
                 mouse: ctx.mouse,
             };
+            let dispatch_start = web_time::Instant::now();
             self.nodes[node_idx].impl_.record(&mut sub_ctx);
+            let dt = dispatch_start.elapsed().as_secs_f32();
+            let entry = &mut self.nodes[node_idx];
+            if entry.dispatch_times.len() == NODE_TIMING_WINDOW {
+                entry.dispatch_times.pop_front();
+            }
+            entry.dispatch_times.push_back(dt);
             passes += 1;
         }
 
@@ -1048,6 +1093,57 @@ impl RenderGraph {
         }
 
         FrameStats { passes }
+    }
+
+    /// Snapshot of the graph's structure + recent per-node timings. The
+    /// HUD uses this to render the dependency tree, memory column, and
+    /// dispatch-time column. Cheap to compute (linear in node count).
+    pub fn summary(&self) -> GraphSummary {
+        // Depth in topological order: each node's depth is
+        // `max(input.depth) + 1`, leaves get 0.
+        let mut depths = vec![0u32; self.nodes.len()];
+        for &i in &self.schedule {
+            let entry = &self.nodes[i];
+            if !entry.inputs.is_empty() {
+                let max_d = entry.inputs.iter().map(|&j| depths[j]).max().unwrap_or(0);
+                depths[i] = max_d + 1;
+            }
+        }
+
+        let mut total_bytes: u64 = 0;
+        let nodes: Vec<NodeSummary> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let mut bytes: u64 = 0;
+                if let Some(inter) = &self.intermediates[i] {
+                    let s = inter.texture.size();
+                    bytes += s.width as u64 * s.height as u64 * 4;
+                }
+                if let Some(viewer) = &self.viewers[i] {
+                    let s = viewer.texture.size();
+                    bytes += s.width as u64 * s.height as u64 * 4;
+                }
+                total_bytes += bytes;
+                let dispatch_ms = if entry.dispatch_times.is_empty() {
+                    0.0
+                } else {
+                    let sum: f32 = entry.dispatch_times.iter().sum();
+                    sum / entry.dispatch_times.len() as f32 * 1000.0
+                };
+                NodeSummary {
+                    id: entry.id.clone(),
+                    depth: depths[i],
+                    bytes,
+                    is_present: i == self.present_index,
+                    viewer_enabled: self.viewer_configs[i].enabled,
+                    dispatch_ms,
+                }
+            })
+            .collect();
+
+        GraphSummary { nodes, total_bytes }
     }
 
     /// Sum of bytes the graph currently has allocated in intermediate

@@ -9,9 +9,10 @@
 use font8x8::legacy::BASIC_LEGACY;
 
 /// HUD bitmap dimensions. 8×8 font with no inter-character spacing fits
-/// roughly 32 chars across; 6 lines plus a few pixels of padding.
-const HUD_WIDTH: u32 = 280;
-const HUD_HEIGHT: u32 = 72;
+/// roughly 36 chars across at this width. Height fits a header line, up to
+/// ~6 lines of dependency tree, and 3 lines of totals — about 10 lines.
+pub const HUD_WIDTH: u32 = 296;
+pub const HUD_HEIGHT: u32 = 96;
 
 /// Translucent black background pixel, premultiplied for the alpha blend.
 const BG_RGBA: [u8; 4] = [0, 0, 0, 180];

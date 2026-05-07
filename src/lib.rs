@@ -11,7 +11,7 @@ use wasm_bindgen::prelude::*;
 
 pub mod hud;
 pub mod render_graph;
-use hud::{backend_label, gpu_label, Hud};
+use hud::Hud;
 use render_graph::{NodeContext, RenderGraph, DEFAULT_GRAPH_TOML};
 
 /// Test-mode overrides parsed from URL params on web. None on native.
@@ -267,15 +267,13 @@ impl State {
             // The HUD pass adds one more render pass to whatever the
             // graph reported, so include it in the displayed total.
             let total_passes = self.last_pass_count + 1;
-            let mem_mib = self.graph.allocated_bytes() as f32 / (1024.0 * 1024.0);
-            let text = format!(
-                "GPU:     {}\nBackend: {}\nMem:     {:.2} MiB\nPasses:  {}\nCPU:     {:.2} ms\nFPS:     {:.1}",
-                gpu_label(&self.adapter_info),
-                backend_label(self.adapter_info.backend),
-                mem_mib,
-                total_passes,
+            let summary = self.graph.summary();
+            let text = build_hud_text(
+                &summary,
+                &self.adapter_info,
                 cpu_ms,
                 fps,
+                total_passes,
             );
             self.hud.set_text(&self.queue, &text);
 
@@ -460,6 +458,67 @@ impl ApplicationHandler<UserEvent> for App {
             _ => {}
         }
     }
+}
+
+/// Build the multi-line HUD text from a graph summary + per-frame
+/// telemetry. Layout — fits in HUD_WIDTH ≈ 36 chars × HUD_HEIGHT ≈ 10 lines:
+///
+/// ```text
+/// RENDER GRAPH         MB    REC ms
+/// mandelbrot v         3.13  0.02
+/// +- invert *  v       3.13  0.02
+/// total: 6.26 MiB / 8 passes
+/// GPU:     <adapter name>
+/// Backend: <backend>  CPU: 0.31 ms
+/// FPS:     60.0
+/// ```
+///
+/// `*` after a node = present node (its output goes to the swapchain).
+/// `v` after a node = `viewer.enabled = true`.
+/// REC ms is encoder-dispatch CPU time per node — NOT real GPU cook
+/// time; that needs `Features::TIMESTAMP_QUERY` plumbing (TODO).
+fn build_hud_text(
+    summary: &render_graph::GraphSummary,
+    adapter_info: &wgpu::AdapterInfo,
+    cpu_ms: f32,
+    fps: f32,
+    passes: u32,
+) -> String {
+    let mut s = String::new();
+    s.push_str("RENDER GRAPH         MB    REC ms\n");
+
+    // Per-node tree lines. Indent two spaces per depth and prefix the
+    // first descendant of each parent with `+- ` for a TD-ish look.
+    for n in &summary.nodes {
+        let indent = "  ".repeat(n.depth.max(1) as usize - if n.depth == 0 { 0 } else { 1 });
+        let branch = if n.depth == 0 { "" } else { "+- " };
+        let mut tags = String::new();
+        if n.is_present {
+            tags.push_str(" *");
+        }
+        if n.viewer_enabled {
+            tags.push_str(" v");
+        }
+        // Compose the left half (id + tags) padded to ~21 chars so the
+        // numeric columns line up.
+        let left = format!("{indent}{branch}{}{}", n.id, tags);
+        let mb = n.bytes as f32 / (1024.0 * 1024.0);
+        s.push_str(&format!("{:<21}{:>5.2} {:>6.2}\n", left, mb, n.dispatch_ms));
+    }
+
+    let total_mib = summary.total_bytes as f32 / (1024.0 * 1024.0);
+    s.push_str(&format!(
+        "total: {:.2} MiB / {} passes\n",
+        total_mib, passes
+    ));
+    s.push_str(&format!("GPU:     {}\n", hud::gpu_label(adapter_info)));
+    s.push_str(&format!(
+        "Backend: {}  CPU: {:.2} ms\n",
+        hud::backend_label(adapter_info.backend),
+        cpu_ms
+    ));
+    s.push_str(&format!("FPS:     {:.1}", fps));
+    s
 }
 
 pub fn run() {
